@@ -1,0 +1,2424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>A Little Aquarium</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html,body{margin:0;padding:0;overflow:hidden;background:#08131a;height:100%;width:100%;}
+  canvas{display:block;}
+  #loading{
+    position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:#08131a;color:#cfe9f2;font-family:Georgia,'Times New Roman',serif;
+    font-size:17px;letter-spacing:1px;z-index:20;transition:opacity 1.2s ease;
+  }
+</style>
+</head>
+<body>
+<div id="loading">Filling the tank&hellip;</div>
+<div id="fishCamHud" style="display:none; position:fixed; top:16px; left:50%; transform:translateX(-50%); color:#ff2b2b; font-family:Georgia,'Times New Roman',serif; font-size:20px; font-weight:bold; letter-spacing:2px; text-shadow:0 0 10px rgba(255,30,30,0.65), 0 2px 4px rgba(0,0,0,0.85); z-index:15; pointer-events:none; white-space:nowrap;">** FISH CAM: <span id="fishCamSpecies"></span> **</div>
+<div id="statsHud" style="display:none; position:fixed; top:16px; left:16px; color:#eaf6ff; font-family:'Courier New',monospace; font-size:13px; line-height:1.6; background:rgba(8,18,24,0.7); border:1px solid rgba(234,246,255,0.25); border-radius:6px; padding:10px 14px; z-index:15; pointer-events:none; white-space:pre;"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+
+// ---------------------------------------------------------------
+// SETUP
+// ---------------------------------------------------------------
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(48, window.innerWidth/window.innerHeight, 0.05, 100);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+renderer.shadowMap.enabled = false;
+document.body.appendChild(renderer.domElement);
+
+window.addEventListener('resize', ()=>{
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+const dummy = new THREE.Object3D();
+const lookScratch = new THREE.Object3D();
+const clock = new THREE.Clock();
+
+// a small environment map for realistic reflective sheen — generated once, defensively wrapped,
+// and applied only to specific materials (not scene.environment) so it stays a scoped enhancement
+let sharedEnvMap = null;
+try {
+  const envCanvas = document.createElement('canvas');
+  envCanvas.width = 32; envCanvas.height = 32;
+  const ectx = envCanvas.getContext('2d');
+  const egrad = ectx.createLinearGradient(0,0,0,32);
+  egrad.addColorStop(0, '#bfe6f2');
+  egrad.addColorStop(0.45, '#8fc9d9');
+  egrad.addColorStop(0.75, '#2d5a4a');
+  egrad.addColorStop(1, '#16302a');
+  ectx.fillStyle = egrad;
+  ectx.fillRect(0,0,32,32);
+  const envTex = new THREE.CanvasTexture(envCanvas);
+  envTex.mapping = THREE.EquirectangularReflectionMapping;
+  envTex.encoding = THREE.sRGBEncoding;
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  pmrem.compileEquirectangularShader();
+  sharedEnvMap = pmrem.fromEquirectangular(envTex).texture;
+  pmrem.dispose();
+} catch(e) {
+  console.warn('Environment map unavailable; angelfish will render without reflective sheen.', e);
+  sharedEnvMap = null;
+}
+
+scene.background = new THREE.Color(0x0a1a22);
+scene.fog = new THREE.FogExp2(0x0e2a33, 0.055);
+
+// ---------------------------------------------------------------
+// TANK DIMENSIONS
+// ---------------------------------------------------------------
+const W = 18.6, H = 3.3, D = 2.9; // interior width, height, depth
+const HALF_W = W/2, HALF_D = D/2;
+
+// ---------------------------------------------------------------
+// LIGHTING — warm light from above, cool ambient glow inside the tank
+// ---------------------------------------------------------------
+const ambientLight = new THREE.AmbientLight(0x224455, 0.55);
+scene.add(ambientLight);
+const topLight = new THREE.SpotLight(0xfff2d8, 1.6, 14, Math.PI/3.2, 0.5, 1.2);
+topLight.position.set(0, H+2.2, 0.6);
+topLight.target.position.set(0, 0, 0);
+scene.add(topLight, topLight.target);
+const glowFill = new THREE.PointLight(0x4fb3d9, 0.5, 10);
+glowFill.position.set(0, H*0.4, D);
+scene.add(glowFill);
+const baseLightIntensity = { ambient: ambientLight.intensity, top: topLight.intensity, glow: glowFill.intensity };
+
+// ---------------------------------------------------------------
+// TANK — glass box, gravel, back wall, frame, stand
+// ---------------------------------------------------------------
+{
+  const backMat = new THREE.MeshStandardMaterial({color:0x0c2b36, roughness:0.9});
+  const back = new THREE.Mesh(new THREE.PlaneGeometry(W, H), backMat);
+  back.position.set(0, H/2, -HALF_D);
+  back.receiveShadow = true;
+  scene.add(back);
+
+  const sideMat = new THREE.MeshPhysicalMaterial({color:0xbfe3ee, roughness:0.05, transparent:true, opacity:0.06, side:THREE.DoubleSide});
+  const sideGeo = new THREE.PlaneGeometry(D, H);
+  const left = new THREE.Mesh(sideGeo, sideMat);
+  left.rotation.y = Math.PI/2; left.position.set(-HALF_W, H/2, 0);
+  const right = left.clone(); right.position.set(HALF_W, H/2, 0);
+  scene.add(left, right);
+
+  {
+    const segsX = Math.round(48 * (W/6.2)), segsZ = 30;
+    const floorGeo = new THREE.PlaneGeometry(W, D, segsX, segsZ);
+    const pos = floorGeo.attributes.position;
+    const baseCol = new THREE.Color(0x362b20);
+    const darkCol = baseCol.clone().lerp(new THREE.Color(0x000000), 0.45);
+    const lightCol = baseCol.clone().lerp(new THREE.Color(0x7a6248), 0.7);
+    const colors = [];
+    for(let i=0;i<pos.count;i++){
+      const x = pos.getX(i), y = pos.getY(i);
+      const dune = fbm3(x*0.35+50, y*0.55+50, 0, 3) - 0.5;   // broad dunes
+      const ripple = fbm3(x*2.2+50, y*2.8+50, 3, 2) - 0.5;   // mid ripples
+      const grain = fbm3(x*9+50, y*9+50, 7, 2) - 0.5;        // fine sand grain
+      pos.setZ(i, dune*0.03 + ripple*0.01 + grain*0.003); // local Z becomes world Y after rotation below
+      const t = THREE.MathUtils.clamp(0.5 + dune*0.7 + ripple*0.3 + grain*0.25, 0, 1);
+      const col = darkCol.clone().lerp(lightCol, t);
+      colors.push(col.r, col.g, col.b);
+    }
+    floorGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors,3));
+    floorGeo.computeVertexNormals();
+    const floorMat = new THREE.MeshStandardMaterial({vertexColors:true, roughness:1});
+    const floor = new THREE.Mesh(floorGeo, floorMat);
+    floor.rotation.x = -Math.PI/2;
+    floor.position.set(0, 0, 0);
+    floor.receiveShadow = true;
+    scene.add(floor);
+  }
+
+  const glassMat = new THREE.MeshPhysicalMaterial({color:0xdff3fb, roughness:0.03, transparent:true, opacity:0.05, side:THREE.DoubleSide});
+  const glass = new THREE.Mesh(new THREE.PlaneGeometry(W, H), glassMat);
+  glass.position.set(0, H/2, HALF_D);
+  scene.add(glass);
+
+  // black bezel frame around the tank
+  const frameMat = new THREE.MeshStandardMaterial({color:0x111214, roughness:0.6});
+  const bezelThick = 0.12;
+  const frameParts = [
+    [W+bezelThick*2, bezelThick, D+bezelThick*2, 0, -bezelThick/2 - 0.05, 0],
+    [W+bezelThick*2, bezelThick, D+bezelThick*2, 0, H+bezelThick/2, 0],
+  ];
+  frameParts.forEach(([sx,sy,sz,x,y,z])=>{
+    const m = new THREE.Mesh(new THREE.BoxGeometry(sx,sy,sz), frameMat);
+    m.position.set(x,y,z);
+    m.castShadow = true; m.receiveShadow = true;
+    scene.add(m);
+  });
+  // vertical corner posts
+  for(const cx of [-HALF_W-bezelThick/2, HALF_W+bezelThick/2]){
+    for(const cz of [-HALF_D-bezelThick/2, HALF_D+bezelThick/2]){
+      const post = new THREE.Mesh(new THREE.BoxGeometry(bezelThick,H+bezelThick*2,bezelThick), frameMat);
+      post.position.set(cx, H/2, cz);
+      scene.add(post);
+    }
+  }
+  // stand beneath
+  const standMat = new THREE.MeshStandardMaterial({color:0x2b1c14, roughness:0.85});
+  const stand = new THREE.Mesh(new THREE.BoxGeometry(W+0.3, 0.9, D+0.2), standMat);
+  stand.position.set(0, -0.7, 0);
+  stand.receiveShadow = true;
+  scene.add(stand);
+}
+
+// ---------------------------------------------------------------
+// GRAVEL BED
+// ---------------------------------------------------------------
+{
+  function makePebbleGeometry(radius, seed, stretch){
+    const geo = new THREE.IcosahedronGeometry(radius, 2);
+    const pos = geo.attributes.position;
+    const v = new THREE.Vector3();
+    for(let i=0;i<pos.count;i++){
+      v.fromBufferAttribute(pos,i);
+      const n = v.clone().normalize();
+      const noise = Math.sin(n.x*9+seed)*Math.cos(n.y*8-seed*1.4)*0.4
+                  + Math.sin(n.z*11-seed*0.8)*0.25;
+      v.multiplyScalar(1+noise*0.16);
+      v.x *= stretch[0]; v.y *= stretch[1]; v.z *= stretch[2];
+      pos.setXYZ(i, v.x, v.y, v.z);
+    }
+    geo.computeVertexNormals();
+    return geo;
+  }
+  const colors = [0xe6d9ad, 0xcdbb8a, 0xb8a476, 0xd0c49a, 0xc7ab8f, 0x9c8f74, 0xdcc9a3];
+  const shapeKinds = [
+    ()=>[0.6+Math.random()*0.5, 0.35+Math.random()*0.2, 0.6+Math.random()*0.5],   // flattish
+    ()=>[0.9+Math.random()*0.4, 0.5+Math.random()*0.25, 0.45+Math.random()*0.3],  // elongated
+    ()=>[0.55+Math.random()*0.3, 0.55+Math.random()*0.3, 0.55+Math.random()*0.3], // roundish
+    ()=>[0.7+Math.random()*0.5, 0.45+Math.random()*0.3, 0.8+Math.random()*0.4],   // angular-ish wide
+  ];
+  const batches = 9;
+  for(let batch=0; batch<batches; batch++){
+    const col = colors[batch % colors.length];
+    const shapeFn = shapeKinds[batch % shapeKinds.length];
+    const mat = new THREE.MeshStandardMaterial({color:col, roughness:1});
+    const count = Math.round(48 * (W/6.2) * 0.15);
+    const mesh = new THREE.InstancedMesh(new THREE.BufferGeometry(), mat, count);
+    // build one shared geometry per batch (distinct per batch, still varied instance-to-instance via transform)
+    const baseR = 0.06+Math.random()*0.035;
+    mesh.geometry = makePebbleGeometry(baseR, Math.random()*40, shapeFn());
+    for(let i=0;i<count;i++){
+      const buried = Math.random() < 0.75;
+      const yBase = buried ? (-0.015+Math.random()*0.025) : (0.035+Math.random()*0.03);
+      dummy.position.set((Math.random()-0.5)*(W-0.15), yBase, (Math.random()-0.5)*(D-0.15));
+      dummy.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
+      const sc = (buried ? 0.7 : 0.55) + Math.random()*0.55;
+      dummy.scale.set(sc, sc, sc);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+  }
+}
+
+// ---------------------------------------------------------------
+// ROCKS
+// ---------------------------------------------------------------
+function hash3(x,y,z){
+  const h = Math.sin(x*127.1+y*311.7+z*74.7)*43758.5453;
+  return h - Math.floor(h);
+}
+function valueNoise3(x,y,z){
+  const xi=Math.floor(x), yi=Math.floor(y), zi=Math.floor(z);
+  const xf=x-xi, yf=y-yi, zf=z-zi;
+  const u=xf*xf*(3-2*xf), v=yf*yf*(3-2*yf), w=zf*zf*(3-2*zf);
+  const lerp=(a,b,t)=>a+(b-a)*t;
+  const c000=hash3(xi,yi,zi), c100=hash3(xi+1,yi,zi), c010=hash3(xi,yi+1,zi), c110=hash3(xi+1,yi+1,zi);
+  const c001=hash3(xi,yi,zi+1), c101=hash3(xi+1,yi,zi+1), c011=hash3(xi,yi+1,zi+1), c111=hash3(xi+1,yi+1,zi+1);
+  const x00=lerp(c000,c100,u), x10=lerp(c010,c110,u), x01=lerp(c001,c101,u), x11=lerp(c011,c111,u);
+  const y0=lerp(x00,x10,v), y1=lerp(x01,x11,v);
+  return lerp(y0,y1,w);
+}
+function fbm3(x,y,z,octaves){
+  let total=0, amp=0.5, freq=1, sum=0;
+  for(let i=0;i<octaves;i++){
+    total += valueNoise3(x*freq,y*freq,z*freq)*amp;
+    sum += amp;
+    amp*=0.52; freq*=2.15;
+  }
+  return total/sum; // roughly 0..1
+}
+function makeRockGeometry(radius, seed, flattenBottom){
+  const geo = new THREE.IcosahedronGeometry(radius, 12);
+  const pos = geo.attributes.position;
+  const v = new THREE.Vector3();
+  const colors = [];
+  const baseCol = new THREE.Color(0x6a7378);
+  const darkCol = new THREE.Color(0x2b3134);
+  const mossDarkCol = new THREE.Color(0x3c5c2e);
+  const mossLightCol = new THREE.Color(0x7a9c4a);
+  const lichenCol = new THREE.Color(0x8a9070);
+  const lichenBrightCol = new THREE.Color(0xc9a13a);
+  const rustCol = new THREE.Color(0x6b4a34);
+  const veinCol = new THREE.Color(0xcac4b2);
+  const sx=seed*3.7, sy=seed*7.1, sz=seed*1.9;
+  for(let i=0;i<pos.count;i++){
+    v.fromBufferAttribute(pos,i);
+    const n = v.clone().normalize();
+    // large-scale chunky irregularity (real fractal noise, not a wavy sine pattern)
+    const big = fbm3(n.x*1.1+sx, n.y*1.1+sy, n.z*1.1+sz, 3) - 0.5;
+    // medium surface undulation
+    const mid = fbm3(n.x*3.2+sx, n.y*3.2+sy, n.z*3.2+sz, 3) - 0.5;
+    // fine grain texture
+    const fine = fbm3(n.x*15+sx, n.y*15+sy, n.z*15+sz, 2) - 0.5;
+    // micro grain — only meaningful at this vertex density; adds pitting/granularity
+    const micro = fbm3(n.x*28+sx, n.y*28+sy, n.z*28+sz, 2) - 0.5;
+    let bump = 1 + big*0.4 + mid*0.16 + fine*0.05 + micro*0.018;
+
+    // detect lichen/moss patches before finalizing position, so they can add real crusty texture
+    let patchT = 0, toneNoise = 0;
+    if (n.y > 0.3){
+      const mossPatch = fbm3(n.x*4.5+sx*2, n.y*4.5+sy*2, n.z*4.5+sz*2, 3);
+      const speckle = fbm3(n.x*13+sx*1.3, n.y*13+sy*1.3, n.z*13+sz*1.3, 2); // finer secondary patchiness
+      const patchSignal = mossPatch*0.7 + speckle*0.3;
+      if (patchSignal > 0.44){
+        patchT = Math.min(1, (patchSignal-0.44)*2.6);
+        toneNoise = fbm3(n.x*3+sx*3.3, n.y*3+sy*3.3, n.z*3+sz*3.3, 2);
+        // lichen/moss growth adds a tiny raised, crusty bump — real texture, not just color
+        const crust = fbm3(n.x*30+sx*1.7, n.y*30+sy*1.7, n.z*30+sz*1.7, 2) - 0.5;
+        bump += patchT * (0.012 + crust*0.014);
+      }
+    }
+    v.multiplyScalar(bump);
+    if (flattenBottom && v.y < -radius*flattenBottom){
+      v.y = -radius*flattenBottom;
+    }
+    pos.setXYZ(i, v.x, v.y, v.z);
+    const crevice = THREE.MathUtils.clamp((bump-0.82)/0.5, 0, 1);
+    let col = darkCol.clone().lerp(baseCol, crevice);
+    // iron/mineral rust staining — broad, soft-edged patches
+    const rustNoise = fbm3(n.x*2.2+sx*1.7, n.y*4.5+sy*1.7, n.z*2.2+sz*1.7, 3);
+    if (rustNoise > 0.6) col.lerp(rustCol, Math.min(0.55, (rustNoise-0.6)*1.9));
+    // pale mineral veins — thin, sharp-edged threads through the stone
+    const veinNoise = fbm3(n.x*5+sx*2.3, n.y*5+sy*2.3, n.z*5+sz*2.3, 2);
+    if (veinNoise > 0.71 && veinNoise < 0.75) col.lerp(veinCol, 0.65);
+    if (patchT > 0){
+      let target;
+      if (toneNoise < 0.3) target = mossDarkCol;
+      else if (toneNoise < 0.55) target = mossLightCol;
+      else if (toneNoise < 0.85) target = lichenCol;
+      else target = lichenBrightCol; // occasional bright yellow-orange accent, common on real rock lichen
+      col.lerp(target, patchT*0.75);
+      const fleck = fbm3(n.x*24+sx, n.y*24+sy, n.z*24+sz, 2);
+      col.multiplyScalar(1 + (fleck-0.5)*0.18);
+    }
+    colors.push(col.r, col.g, col.b);
+  }
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors,3));
+  geo.computeVertexNormals();
+  return geo;
+}
+const mossMats = [
+  new THREE.MeshStandardMaterial({color:0x3c5c2e, roughness:0.95}),
+  new THREE.MeshStandardMaterial({color:0x6a8c40, roughness:0.95}),
+  new THREE.MeshStandardMaterial({color:0x8a9070, roughness:0.95}),
+];
+const lichenDiscMats = [
+  new THREE.MeshStandardMaterial({color:0x8a9070, roughness:0.9}),
+  new THREE.MeshStandardMaterial({color:0xb8a860, roughness:0.85}),
+  new THREE.MeshStandardMaterial({color:0xc9a13a, roughness:0.85}),
+  new THREE.MeshStandardMaterial({color:0x6a7a4a, roughness:0.92}),
+];
+function addMossToRock(rock, radius){
+  const tuftCount = 5+Math.floor(radius*14)+Math.floor(Math.random()*4);
+  const q = rock.quaternion;
+  const invQuat = new THREE.Quaternion(-q.x, -q.y, -q.z, q.w); // conjugate = inverse for a unit quaternion; avoids relying on .invert()/.inverse() naming
+  for(let i=0;i<tuftCount;i++){
+    const theta = Math.random()*Math.PI*2;
+    const phi = Math.random()*Math.PI*0.42; // small cone around world-up, so moss lands on top faces regardless of the rock's random rotation
+    const worldDir = new THREE.Vector3(Math.sin(phi)*Math.cos(theta), Math.cos(phi), Math.sin(phi)*Math.sin(theta));
+    const localDir = worldDir.applyQuaternion(invQuat);
+    const pos = localDir.multiplyScalar(radius*0.97);
+    const tuftGeo = new THREE.SphereGeometry(radius*0.2*(0.7+Math.random()*0.7), 5, 4);
+    const tuft = new THREE.Mesh(tuftGeo, mossMats[Math.floor(Math.random()*mossMats.length)]);
+    tuft.position.copy(pos);
+    tuft.scale.set(1, 0.4+Math.random()*0.15, 1);
+    rock.add(tuft);
+  }
+  // flat crusty lichen discs, distinct from the puffy moss tufts — sit flush against the rock surface
+  const discCount = 4+Math.floor(radius*12)+Math.floor(Math.random()*4);
+  for(let i=0;i<discCount;i++){
+    const theta = Math.random()*Math.PI*2;
+    const phi = Math.random()*Math.PI*0.55; // lichen grows across a broader area than the moss tufts
+    const worldDir = new THREE.Vector3(Math.sin(phi)*Math.cos(theta), Math.cos(phi), Math.sin(phi)*Math.sin(theta));
+    const localDir = worldDir.applyQuaternion(invQuat).normalize();
+    const pos = localDir.clone().multiplyScalar(radius*0.985);
+    const discR = radius*0.13*(0.6+Math.random()*0.9);
+    const discGeo = new THREE.CylinderGeometry(discR, discR*0.8, radius*0.025, 7);
+    const disc = new THREE.Mesh(discGeo, lichenDiscMats[Math.floor(Math.random()*lichenDiscMats.length)]);
+    disc.position.copy(pos);
+    disc.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), localDir);
+    rock.add(disc);
+  }
+}
+const rockObstacles = []; // {position, radius} — used by fish to steer clear of rocks
+const skirtColors = [0xe6d9ad, 0xcdbb8a, 0xb8a476, 0xd0c49a, 0xc7ab8f];
+const skirtMats = skirtColors.map(c=>new THREE.MeshStandardMaterial({color:c, roughness:1}));
+function addBaseSkirt(rockPos, sc){
+  const count = 8+Math.floor(sc*12);
+  for(let i=0;i<count;i++){
+    const ang = Math.random()*Math.PI*2;
+    const r = sc*(0.7+Math.random()*0.55);
+    const geo = new THREE.IcosahedronGeometry(0.035+Math.random()*0.03, 1);
+    const mesh = new THREE.Mesh(geo, skirtMats[Math.floor(Math.random()*skirtMats.length)]);
+    mesh.position.set(rockPos.x+Math.cos(ang)*r, 0.02+Math.random()*0.03, rockPos.z+Math.sin(ang)*r);
+    mesh.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
+    const stretch = 0.7+Math.random()*0.6;
+    mesh.scale.set(stretch, stretch*0.6, stretch);
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+  }
+}
+function scatterRocks(clusters){
+  const matOpts = { vertexColors:true, roughness:0.75, clearcoat:0.25, clearcoatRoughness:0.55 };
+  if (sharedEnvMap){ matOpts.envMap = sharedEnvMap; matOpts.envMapIntensity = 0.5; }
+  const mat = new THREE.MeshPhysicalMaterial(matOpts);
+  const rockShapes = [
+    ()=>[0.65+Math.random()*0.3, 0.32+Math.random()*0.18, 0.8+Math.random()*0.35],  // flat slab
+    ()=>[1.0+Math.random()*0.4, 0.55+Math.random()*0.25, 0.5+Math.random()*0.3],    // elongated
+    ()=>[0.8+Math.random()*0.3, 0.7+Math.random()*0.3, 0.75+Math.random()*0.3],     // blocky/round
+    ()=>[0.55+Math.random()*0.35, 0.85+Math.random()*0.35, 0.9+Math.random()*0.4],  // tall angular
+  ];
+  clusters.forEach(([cx,cz])=>{
+    const n = 4+Math.floor(Math.random()*4);
+    for(let i=0;i<n;i++){
+      const sc = 0.14+Math.random()*0.26;
+      const isBig = sc > 0.3;
+      const [stx,sty,stz] = rockShapes[Math.floor(Math.random()*rockShapes.length)]();
+      let rock, posY, rotX, rotY, rotZ, radiusEstimate;
+      if (isBig){
+        // very big stones get a real flat-cut base and a constrained "settled" orientation
+        // (small tilt, free spin only around Y) so the flat cut reliably faces downward —
+        // a fully random 3-axis tumble would put it sideways just as often as down.
+        const flattenAmt = 0.32+Math.random()*0.16;
+        const geo = makeRockGeometry(sc, Math.random()*40, flattenAmt);
+        rock = new THREE.Mesh(geo, mat);
+        rotX = (Math.random()-0.5)*0.3;
+        rotY = Math.random()*Math.PI*2;
+        rotZ = (Math.random()-0.5)*0.3;
+        posY = -0.05 + sc*flattenAmt*sty;
+        radiusEstimate = sc*Math.max(stx,sty,stz)*1.15;
+      } else {
+        const geo = makeRockGeometry(sc, Math.random()*40);
+        rock = new THREE.Mesh(geo, mat);
+        rotX = Math.random()*Math.PI; rotY = Math.random()*Math.PI; rotZ = Math.random()*Math.PI;
+        const maxStretch = Math.max(stx, sty, stz);
+        const burialMult = THREE.MathUtils.mapLinear(sc, 0.14, 0.3, 1.2, 0.85);
+        posY = -0.05 + sc*maxStretch*burialMult;
+        radiusEstimate = sc*maxStretch*1.15;
+      }
+      rock.position.set(cx+(Math.random()-0.5)*0.4, posY, cz+(Math.random()-0.5)*0.35);
+      rock.rotation.set(rotX, rotY, rotZ);
+      rock.scale.set(stx, sty, stz);
+      rock.castShadow = true; rock.receiveShadow = true;
+      if (sc > 0.27 || Math.random() < 0.5) addMossToRock(rock, sc);
+      if (isBig) addBaseSkirt(rock.position, sc);
+      scene.add(rock);
+      rockObstacles.push({position: rock.position.clone(), radius: radiusEstimate});
+    }
+  });
+}
+[-6.2, 0, 6.2].forEach(ox=>{
+  scatterRocks([[ox-2.1,-0.6],[ox+2.2,-0.6],[ox+1.4,-1.0]]);
+});
+
+// rock-cave shelter — two large angled pillar rocks leaning together to form an archway,
+// flanked by two smaller rocks, sitting on a dense moss carpet (modeled on the reference photo)
+function makeStratifiedRockGeometry(radius, seed, palette){
+  palette = palette || { light:0xd9c6a3, mid:0xbaa178, dark:0x8c7456, accent:0xa87a4a };
+  const geo = new THREE.IcosahedronGeometry(radius, 12);
+  const pos = geo.attributes.position;
+  const v = new THREE.Vector3();
+  const colors = [];
+  const beigeLight = new THREE.Color(palette.light);
+  const beigeMid = new THREE.Color(palette.mid);
+  const beigeDark = new THREE.Color(palette.dark);
+  const rustCol = new THREE.Color(palette.accent);
+  const sx=seed*3.7, sy=seed*7.1, sz=seed*1.9;
+  const layerFreq = 9 + (Math.floor(seed)%4);
+  for(let i=0;i<pos.count;i++){
+    v.fromBufferAttribute(pos,i);
+    const n = v.clone().normalize();
+    const big = fbm3(n.x*1.1+sx, n.y*1.1+sy, n.z*1.1+sz, 3) - 0.5;
+    const mid = fbm3(n.x*3.2+sx, n.y*3.2+sy, n.z*3.2+sz, 3) - 0.5;
+    const fine = fbm3(n.x*15+sx, n.y*15+sy, n.z*15+sz, 2) - 0.5;
+    let bump = 1 + big*0.32 + mid*0.13 + fine*0.04; // flatter overall than the igneous rock variant
+
+    // horizontal stratification — stepped layers with a visible fracture line at each boundary,
+    // like an eroded sedimentary rock face
+    const layerPos = v.y/radius * layerFreq;
+    const layerIdx = Math.floor(layerPos);
+    const layerFrac = layerPos - layerIdx;
+    const layerStep = fbm3(layerIdx*4.3+sx, 7.7, 0, 2) - 0.5;
+    const edgeSharp = Math.pow(Math.abs(layerFrac-0.5)*2, 3);
+    bump += layerStep*0.05*(1-edgeSharp*0.4);
+
+    v.multiplyScalar(bump);
+    pos.setXYZ(i, v.x, v.y, v.z);
+
+    const crevice = THREE.MathUtils.clamp((bump-0.86)/0.4, 0, 1);
+    const layerTone = fbm3(layerIdx*9.1+sx*0.7, 3.3, 0, 2);
+    const base = beigeDark.clone().lerp(beigeLight, layerTone);
+    const col = base.clone().lerp(beigeMid, 1-crevice);
+    const rustNoise = fbm3(n.x*2.4+sx*1.6, n.y*5+sy*1.6, n.z*2.4+sz*1.6, 3);
+    if (rustNoise > 0.62) col.lerp(rustCol, Math.min(0.5, (rustNoise-0.62)*1.8));
+    if (edgeSharp > 0.75) col.multiplyScalar(0.82); // darken right at the fracture lines
+    colors.push(col.r, col.g, col.b);
+  }
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors,3));
+  geo.computeVertexNormals();
+  return geo;
+}
+function buildStratifiedRockShelter(cx, cz, palette){
+  const matOpts = { vertexColors:true, roughness:0.85, clearcoat:0.1, clearcoatRoughness:0.7 };
+  if (sharedEnvMap){ matOpts.envMap = sharedEnvMap; matOpts.envMapIntensity = 0.3; }
+  const mat = new THREE.MeshPhysicalMaterial(matOpts);
+  const slabs = [
+    {dx:-0.5, dz:-0.05, rotY:0.4, rotX:0.35, rotZ:-0.1, r:0.44, flat:0.42},
+    {dx:0.4, dz:0.02, rotY:-0.35, rotX:0.3, rotZ:0.12, r:0.4, flat:0.4},
+    {dx:-1.0, dz:0.3, rotY:0.15, rotX:0.1, rotZ:-0.05, r:0.3, flat:0.45},
+    {dx:0.95, dz:0.32, rotY:-0.1, rotX:0.08, rotZ:0.06, r:0.28, flat:0.42},
+  ];
+  slabs.forEach(p=>{
+    const geo = makeStratifiedRockGeometry(p.r, Math.random()*40, palette);
+    const rock = new THREE.Mesh(geo, mat);
+    // flatter (low Y-stretch) and slightly widened footprint — tumbled slabs, not upright pillars
+    rock.position.set(cx+p.dx, -0.03 + p.r*p.flat*1.15, cz+p.dz);
+    rock.rotation.set(p.rotX, p.rotY, p.rotZ);
+    rock.scale.set(1.25, p.flat, 1.15);
+    rock.castShadow = true; rock.receiveShadow = true;
+    scene.add(rock);
+    rockObstacles.push({position: rock.position.clone(), radius: p.r*1.25*1.1});
+  });
+}
+function buildRockCaveShelter(cx, cz){
+  const matOpts = { vertexColors:true, roughness:0.75, clearcoat:0.22, clearcoatRoughness:0.55 };
+  if (sharedEnvMap){ matOpts.envMap = sharedEnvMap; matOpts.envMapIntensity = 0.45; }
+  const mat = new THREE.MeshPhysicalMaterial(matOpts);
+  const pillars = [
+    {dx:-0.45, dz:-0.05, rotY:0.55, rotZ:-0.4, r:0.42, tall:1.5},
+    {dx:0.45, dz:-0.05, rotY:-0.55, rotZ:0.4, r:0.42, tall:1.5},
+    {dx:-0.95, dz:0.25, rotY:0.2, rotZ:-0.12, r:0.3, tall:1.1},
+    {dx:0.95, dz:0.28, rotY:-0.2, rotZ:0.12, r:0.28, tall:1.05},
+  ];
+  pillars.forEach(p=>{
+    const geo = makeRockGeometry(p.r, Math.random()*40);
+    const rock = new THREE.Mesh(geo, mat);
+    // account for the Y stretch (p.tall) so the rock's actual bottom sits just below sand level,
+    // not the unstretched radius — otherwise a tall pillar's true bottom hangs well below the sand
+    rock.position.set(cx+p.dx, -0.05 + p.r*p.tall*1.2, cz+p.dz);
+    rock.rotation.set(0.15+Math.random()*0.15, p.rotY, p.rotZ);
+    rock.scale.set(1, p.tall, 1);
+    rock.castShadow = true; rock.receiveShadow = true;
+    addMossToRock(rock, p.r);
+    scene.add(rock);
+    rockObstacles.push({position: rock.position.clone(), radius: p.r*p.tall*1.1});
+  });
+}
+buildStratifiedRockShelter(-6.2, 0.15, {light:0xc97a52, mid:0xa8543a, dark:0x6b2f1f, accent:0x2a1810});
+buildRockCaveShelter(0, 0.15);
+buildStratifiedRockShelter(6.2, 0.15);
+
+// ---------------------------------------------------------------
+// PLANTS — swaying strands, built from tapered curved blades
+// ---------------------------------------------------------------
+function makeBladeGeometry(height, width, curveAmt, segs, colorBase, seed, foldDepth){
+  segs = segs || 22;
+  seed = seed || 0;
+  foldDepth = foldDepth===undefined ? 0.14 : foldDepth;
+  const positions = [], indices = [], uvs = [], colors = [];
+  const base = new THREE.Color(colorBase || 0x3f9159);
+  const tip = base.clone().lerp(new THREE.Color(0xdfefa0), 0.55);
+  const dark = base.clone().lerp(new THREE.Color(0x0a2010), 0.35);
+  const rib = base.clone().lerp(new THREE.Color(0xffffff), 0.2);
+  for(let i=0;i<=segs;i++){
+    const h = i/segs;
+    const w = width * (1-h*0.72) * 0.5;
+    const wave = Math.sin(h*7+seed)*width*0.05;
+    const bend = Math.sin(h*Math.PI*0.5) * curveAmt;
+    const y = h*height;
+    const foldZ = bend - w*foldDepth; // center pulled back slightly, creating a subtle crease down the midrib
+    positions.push(-w+wave, y, bend,  wave*0.3, y, foldZ,  w+wave, y, bend);
+    uvs.push(0,h, 0.5,h, 1,h);
+    const edgeCol = dark.clone().lerp(tip, Math.pow(h,0.8));
+    const ribCol = rib.clone().lerp(tip, Math.pow(h,0.7));
+    colors.push(edgeCol.r*0.85, edgeCol.g*0.85, edgeCol.b*0.85, ribCol.r, ribCol.g, ribCol.b, edgeCol.r, edgeCol.g, edgeCol.b);
+  }
+  for(let i=0;i<segs;i++){
+    const rowA = i*3, rowB = (i+1)*3;
+    indices.push(rowA, rowB, rowA+1,  rowA+1, rowB, rowB+1);
+    indices.push(rowA+1, rowB+1, rowA+2,  rowA+2, rowB+1, rowB+2);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs,2));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors,3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
+}
+const swayingPlants = [];
+function plantCluster(cx, cz, count, heightRange, colorOpts){
+  for(let i=0;i<count;i++){
+    const h = heightRange[0] + Math.random()*(heightRange[1]-heightRange[0]);
+    const col = colorOpts[Math.floor(Math.random()*colorOpts.length)];
+    const geo = makeBladeGeometry(h, 0.09+Math.random()*0.05, (Math.random()-0.5)*0.5, 22, col, Math.random()*10);
+    const mat = new THREE.MeshStandardMaterial({vertexColors:true, roughness:0.72, side:THREE.DoubleSide});
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(cx+(Math.random()-0.5)*0.7, 0, cz+(Math.random()-0.5)*0.5);
+    mesh.rotation.y = Math.random()*Math.PI*2;
+    mesh.castShadow = true;
+    scene.add(mesh);
+    swayingPlants.push({mesh, phase: Math.random()*10, amp: 0.12+Math.random()*0.08, baseRotZ: 0});
+  }
+}
+// a fuller crown plant (sword-plant style): broader leaves splaying outward from one base point
+function plantRosette(cx, cz, leafCount, heightRange, colorOpts, widthMult){
+  widthMult = widthMult || 1;
+  for(let i=0;i<leafCount;i++){
+    const h = heightRange[0] + Math.random()*(heightRange[1]-heightRange[0]);
+    const col = colorOpts[Math.floor(Math.random()*colorOpts.length)];
+    const w = (0.15+Math.random()*0.08)*widthMult;
+    const geo = makeBladeGeometry(h, w, 0.4+Math.random()*0.55, 26, col, Math.random()*10, 0.2);
+    const mat = new THREE.MeshStandardMaterial({vertexColors:true, roughness:0.68, side:THREE.DoubleSide});
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(cx, 0, cz);
+    mesh.rotation.y = (i/leafCount)*Math.PI*2 + Math.random()*0.4;
+    const baseLean = -0.28-Math.random()*0.3;
+    mesh.rotation.z = baseLean;
+    mesh.castShadow = true;
+    scene.add(mesh);
+    swayingPlants.push({mesh, phase: Math.random()*10, amp: 0.05+Math.random()*0.04, baseRotZ: baseLean});
+  }
+}
+function plantFeatureClusters(ox){
+  plantCluster(ox-2.9, -1.0, 9, [0.5,1.1], [0x2f7a4a,0x3f9159,0x27633c]);
+  plantCluster(ox+3.0, -0.4, 8, [0.4,0.95], [0x2f7a4a,0x3f9159]);
+  plantCluster(ox+0.3, -0.85, 7, [0.6,1.3], [0x37855a,0x2c6b46]);
+  plantCluster(ox-1.4, 0.7, 6, [0.35,0.7], [0x9fb95a,0x87a84c]);
+  // a denser, taller clump tucked at the back — shelter cover for the small fish (tetras, guppies)
+  plantCluster(ox+0.1, -1.15, 20, [0.65,1.25], [0x2c6b3f,0x347a48,0x3a8a4f]);
+}
+[-6.2, 0, 6.2].forEach(plantFeatureClusters);
+
+// wide grass backdrop spanning the whole back wall, sized to the actual tank width
+const backdropHeightPool = [[0.4,0.75],[0.65,1.15],[0.95,1.6],[1.35,2.0]];
+const backdropColors = [0x2c6b3f,0x347a48,0x235a34,0x3a8a4f,0x1e4d2c];
+const backdropSpacing = 0.743;
+const backdropStart = -HALF_W+0.5;
+const backdropCount = Math.max(1, Math.floor((W-1.0)/backdropSpacing));
+for(let i=0;i<backdropCount;i++){
+  const bx = backdropStart + i*backdropSpacing;
+  const hr = backdropHeightPool[Math.floor(Math.random()*backdropHeightPool.length)];
+  plantCluster(bx, -1.15, 15+Math.floor(Math.random()*9), hr, backdropColors);
+}
+// interleaved fill pass between the main clumps, mostly shorter, for continuous coverage
+for(let i=0;i<backdropCount-1;i++){
+  const bx = backdropStart + backdropSpacing/2 + i*backdropSpacing;
+  const hr = backdropHeightPool[Math.floor(Math.random()*2)]; // bias toward the shorter brackets
+  plantCluster(bx, -1.16, 9+Math.floor(Math.random()*6), hr, backdropColors);
+}
+[-6.2, 0, 6.2].forEach(ox=>{
+  plantRosette(ox-2.9, -1.15, 7, [0.55,0.95], [0x3a7a4a,0x2f6b40], 1.6);
+  plantRosette(ox+3.1, -0.7, 6, [0.45,0.8], [0x3a7a4a,0x4a8a55], 1.4);
+});
+
+// feathery/bushy stem plant (like Cabomba/Myriophyllum) — whorls of thin leaflets around a central stem
+function plantFeathery(cx, cz, stemCount, heightRange, colorOpts){
+  for(let s=0; s<stemCount; s++){
+    const stemH = heightRange[0] + Math.random()*(heightRange[1]-heightRange[0]);
+    const col = colorOpts[Math.floor(Math.random()*colorOpts.length)];
+    const leafGeo = makeBladeGeometry(0.06, 0.012, 0.1, 6, col, Math.random()*10, 0.04);
+    const leafMat = new THREE.MeshStandardMaterial({vertexColors:true, roughness:0.7, side:THREE.DoubleSide});
+    const whorls = Math.max(5, Math.min(10, Math.round(stemH*9)));
+    const leafletsPerWhorl = 5;
+    const leaves = new THREE.InstancedMesh(leafGeo, leafMat, whorls*leafletsPerWhorl);
+    let idx = 0;
+    for(let w=0; w<whorls; w++){
+      const hFrac = w/whorls;
+      const y = hFrac*stemH;
+      for(let l=0;l<leafletsPerWhorl;l++){
+        const ang = (l/leafletsPerWhorl)*Math.PI*2 + hFrac*3.5;
+        dummy.position.set(0,y,0);
+        dummy.rotation.set(Math.PI/2-0.25, ang, 0);
+        const sc = 1-hFrac*0.35;
+        dummy.scale.set(sc,sc,sc);
+        dummy.updateMatrix();
+        leaves.setMatrixAt(idx++, dummy.matrix);
+      }
+    }
+    leaves.instanceMatrix.needsUpdate = true;
+    leaves.castShadow = true;
+    const stemMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.006,0.01,stemH,10), new THREE.MeshStandardMaterial({color:col, roughness:0.7}));
+    stemMesh.position.y = stemH/2;
+    const group = new THREE.Group();
+    group.add(stemMesh, leaves);
+    group.position.set(cx+(Math.random()-0.5)*0.5, 0, cz+(Math.random()-0.5)*0.4);
+    group.rotation.y = Math.random()*Math.PI*2;
+    scene.add(group);
+    swayingPlants.push({mesh: group, phase: Math.random()*10, amp: 0.045+Math.random()*0.03, baseRotZ: 0});
+  }
+}
+// small-leafed stem plant (like Rotala/Ludwigia) — paired oval leaves spiraling up a stem, often reddish
+// delicate fern — several flat fronds fanning from a base, each with many tiny paired leaflets
+// arranged along a gentle curve (a lacy, flat pinnate structure, unlike a stem plant's spiral)
+function plantFern(cx, cz, frondCount, heightRange, colorOpts){
+  for(let f=0; f<frondCount; f++){
+    const frondH = heightRange[0] + Math.random()*(heightRange[1]-heightRange[0]);
+    const col = colorOpts[Math.floor(Math.random()*colorOpts.length)];
+    const leafGeo = new THREE.SphereGeometry(0.013, 7, 6);
+    const leafMat = new THREE.MeshStandardMaterial({color:col, roughness:0.6, side:THREE.DoubleSide});
+    const pairs = Math.max(7, Math.round(frondH*26));
+    const leaves = new THREE.InstancedMesh(leafGeo, leafMat, pairs*2);
+    let idx = 0;
+    const curveAmt = 0.12+Math.random()*0.15;
+    for(let p=0;p<pairs;p++){
+      const hFrac = p/pairs;
+      const y = hFrac*frondH;
+      const bend = Math.sin(hFrac*Math.PI*0.5)*curveAmt;
+      const leafletLen = 0.03*(1-hFrac*0.5);
+      [-1,1].forEach(side=>{
+        dummy.position.set(side*leafletLen, y, bend);
+        dummy.rotation.set(0, 0, side*(0.5+hFrac*0.3));
+        const sc = 0.8+Math.random()*0.3;
+        dummy.scale.set(sc*1.6, sc*0.5, sc*0.5);
+        dummy.updateMatrix();
+        leaves.setMatrixAt(idx++, dummy.matrix);
+      });
+    }
+    leaves.instanceMatrix.needsUpdate = true;
+    leaves.castShadow = true;
+    const stemMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.005,0.009,frondH,8), new THREE.MeshStandardMaterial({color:0x2c4a28, roughness:0.7}));
+    stemMesh.position.y = frondH/2;
+    const group = new THREE.Group();
+    group.add(stemMesh, leaves);
+    const tilt = 0.15+Math.random()*0.2;
+    group.position.set(cx+(Math.random()-0.5)*0.3, 0, cz+(Math.random()-0.5)*0.25);
+    group.rotation.y = (f/frondCount)*Math.PI*2 + Math.random()*0.3;
+    group.rotation.z = -tilt; // gentle outward arch from the crown, like a real fern frond
+    scene.add(group);
+    swayingPlants.push({mesh: group, phase: Math.random()*10, amp: 0.035+Math.random()*0.02, baseRotZ: -tilt});
+  }
+}
+[-6.2, 0, 6.2].forEach(ox=>{
+  plantFeathery(ox-1.1, -0.55, 4, [0.6,1.0], [0x2f6b3f,0x3a7a4a]);
+  plantFeathery(ox+1.7, 0.55, 3, [0.4,0.75], [0x255c38,0x2f6b3f]);
+  plantFern(ox+1.3, 0.75, 6, [0.26,0.48], [0x3a6b3a,0x2f5c30,0x4a7c46]);
+  plantFern(ox-1.7, 0.35, 5, [0.3,0.55], [0x336339,0x2a5230]);
+});
+
+// tiny oxygen-pearl specks clinging to the leaves, as on real planted tanks
+{
+  const baseSpots = [[-2.4,-0.9,1.0],[2.5,-0.6,0.85],[0.6,-1.0,1.1],[-0.5,0.6,0.6]];
+  const spots = [];
+  [-6.2, 0, 6.2].forEach(ox=>{
+    baseSpots.forEach(([cx,cz,hMax])=>spots.push([cx+ox,cz,hMax]));
+  });
+  const countEach = 12;
+  const geo = new THREE.SphereGeometry(1,6,5);
+  const mat = new THREE.MeshPhysicalMaterial({color:0xeaffff, transparent:true, opacity:0.6, roughness:0.05, clearcoat:1});
+  const mesh = new THREE.InstancedMesh(geo, mat, spots.length*countEach);
+  let idx=0;
+  spots.forEach(([cx,cz,hMax])=>{
+    for(let i=0;i<countEach;i++){
+      dummy.position.set(cx+(Math.random()-0.5)*0.9, 0.08+Math.random()*hMax, cz+(Math.random()-0.5)*0.7);
+      const sc = 0.006+Math.random()*0.009;
+      dummy.scale.setScalar(sc);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(idx++, dummy.matrix);
+    }
+  });
+  mesh.instanceMatrix.needsUpdate = true;
+  scene.add(mesh);
+}
+
+function updatePlants(t){
+  swayingPlants.forEach(({mesh, phase, amp, baseRotZ})=>{
+    mesh.rotation.z = (baseRotZ||0) + Math.sin(t*0.7+phase)*amp*0.5;
+  });
+}
+
+// ---------------------------------------------------------------
+// FISH — smooth tapered ring-lofted bodies, a few charming species
+// ---------------------------------------------------------------
+function makeDetailedFinGeometry(pts, baseColorHex, opts){
+  opts = opts || {};
+  const uSteps = opts.uSteps || 7;
+  const base = pts[0];
+  const boundary = pts.slice(1);
+  const vCount = boundary.length;
+  const vSteps = opts.vSteps || (vCount-1)*3;
+  const rayCount = opts.rayCount===undefined ? 5 : opts.rayCount;
+  const billow = opts.billow===undefined ? 1 : opts.billow;
+  const baseCol = new THREE.Color(baseColorHex);
+  const rayCol = baseCol.clone().multiplyScalar(0.55);
+  const tipCol = baseCol.clone().lerp(new THREE.Color(0xffffff), 0.32);
+
+  function boundaryAt(vFrac){
+    const scaled = vFrac*(vCount-1);
+    const seg = Math.min(vCount-2, Math.floor(scaled));
+    const segFrac = scaled-seg;
+    const p0 = boundary[seg], p1 = boundary[seg+1];
+    return [
+      p0[0]+(p1[0]-p0[0])*segFrac,
+      p0[1]+(p1[1]-p0[1])*segFrac,
+      p0[2]+(p1[2]-p0[2])*segFrac
+    ];
+  }
+
+  const positions = [], colors = [];
+  for(let ui=0; ui<=uSteps; ui++){
+    const u = ui/uSteps;
+    for(let vi=0; vi<=vSteps; vi++){
+      const v = vi/vSteps;
+      const b = boundaryAt(v);
+      const x = base[0]+(b[0]-base[0])*u;
+      const y = base[1]+(b[1]-base[1])*u;
+      let z = base[2]+(b[2]-base[2])*u;
+      z += Math.sin(v*Math.PI)*0.012*u*billow; // gentle natural curvature, strongest at the tip
+      positions.push(x,y,z);
+      const rayPhase = Math.abs(Math.sin(v*Math.PI*rayCount));
+      const rayDark = Math.pow(1-rayPhase,3) * u; // ray lines fade in from base to tip, not at the root
+      const col = baseCol.clone().lerp(rayCol, rayDark*0.6);
+      col.lerp(tipCol, u*u*0.32); // pales toward the tip — a stylized translucency cue
+      colors.push(col.r, col.g, col.b);
+    }
+  }
+  const indices = [];
+  for(let ui=0; ui<uSteps; ui++){
+    for(let vi=0; vi<vSteps; vi++){
+      const a = ui*(vSteps+1)+vi, b2 = a+1, c = a+(vSteps+1), d = c+1;
+      indices.push(a,c,b2, b2,c,d);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors,3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
+}
+function makeFinGeometry(pts){
+  const positions = [];
+  pts.forEach(p=>positions.push(p[0],p[1],p[2]));
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
+  const indices = [];
+  for(let i=1;i<pts.length-1;i++) indices.push(0,i,i+1);
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function smooth01(e0,e1,x){
+  const t = Math.min(1, Math.max(0, (x-e0)/(e1-e0)));
+  return t*t*(3-2*t);
+}
+function scaleBump(b, angFrac, rows, cols){
+  const rowPos = b*rows;
+  const row = Math.floor(rowPos);
+  const rowFrac = rowPos-row;
+  const colShift = (row%2)*0.5;
+  const colPos = angFrac*cols + colShift;
+  const col = Math.floor(colPos);
+  const colFrac = colPos-col;
+  const dx = rowFrac-0.62, dy = colFrac-0.5;
+  const d = Math.sqrt(dx*dx*1.7 + dy*dy);
+  return Math.max(0, 1-d*2.15);
+}
+
+function buildFishBody(length, species){
+  const height = length*species.heightScale, width = length*species.widthScale;
+  const detailMult = species.detailMult || 1;
+  const ringCount = Math.round(34*detailMult), radialSegs = Math.round(18*detailMult);
+  const positions = [], colors = [], bValues = [];
+  const c = new THREE.Color();
+
+  function profileAt(b){
+    const profile = Math.sin(Math.min(1,b*1.08)*Math.PI);
+    const taper = 1 - Math.pow(b,3)*0.55;
+    return {
+      halfH: Math.max(0.01, height*0.5*profile*taper),
+      halfW: Math.max(0.01, width*0.5*profile*taper)
+    };
+  }
+
+  const scaleRows = Math.round(length*46);
+  const scaleCols = radialSegs;
+  const scaleFade = (b)=> smooth01(0,0.1,b) * (1-smooth01(0.86,1,b));
+
+  for(let r=0; r<ringCount; r++){
+    const b = r/(ringCount-1);
+    const {halfH, halfW} = profileAt(b);
+    const fade = scaleFade(b);
+    for(let s=0; s<radialSegs; s++){
+      const ang = (s/radialSegs)*Math.PI*2;
+      const angFrac = s/radialSegs;
+      const bump = scaleBump(b, angFrac, scaleRows, scaleCols);
+      const rMul = 1 + (bump-0.4)*0.11*fade;
+      const cy = Math.sin(ang)*halfH*rMul;
+      positions.push(Math.cos(ang)*halfW*rMul, cy, (b-0.5)*length);
+      bValues.push(b);
+      species.colorFn(c, b, halfH? cy/(halfH*rMul) : 0);
+      const shade = 1 - bump*0.09*fade;
+      const peakBoost = Math.max(0, bump-0.7)*0.5*fade;
+      colors.push(
+        Math.min(1, c.r*shade + peakBoost*0.15),
+        Math.min(1, c.g*shade + peakBoost*0.15),
+        Math.min(1, c.b*shade + peakBoost*0.2)
+      );
+    }
+  }
+  const indices = [];
+  for(let r=0;r<ringCount-1;r++){
+    for(let s=0;s<radialSegs;s++){
+      const a=r*radialSegs+s, b2=r*radialSegs+(s+1)%radialSegs;
+      const cc=(r+1)*radialSegs+s, d=(r+1)*radialSegs+(s+1)%radialSegs;
+      indices.push(a,cc,b2, b2,cc,d);
+    }
+  }
+  const headIdx = positions.length/3;
+  positions.push(0,0,-length*0.52); bValues.push(0);
+  species.colorFn(c,0,0.6); colors.push(c.r,c.g,c.b);
+  for(let s=0;s<radialSegs;s++) indices.push(headIdx, s, (s+1)%radialSegs);
+  const tailIdx = positions.length/3;
+  const lastRing = (ringCount-1)*radialSegs;
+  positions.push(0,0,length*0.5); bValues.push(1);
+  species.colorFn(c,1,-0.6); colors.push(c.r,c.g,c.b);
+  for(let s=0;s<radialSegs;s++) indices.push(tailIdx, lastRing+(s+1)%radialSegs, lastRing+s);
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors,3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+
+  const matOpts = Object.assign(
+    { vertexColors:true, roughness:0.3, metalness:0.15, clearcoat:0.75, clearcoatRoughness:0.1, side:THREE.DoubleSide },
+    species.matTune || {}
+  );
+  if (species.matTune && sharedEnvMap){ matOpts.envMap = sharedEnvMap; }
+  const mat = new THREE.MeshPhysicalMaterial(matOpts);
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.castShadow = true; mesh.receiveShadow = true;
+  mesh.userData = {basePositions: positions.slice(), bValues};
+
+  const finMatOpts = { color: 0xffffff, vertexColors:true, roughness:0.45, transparent:true, opacity:0.85, side:THREE.DoubleSide };
+  if (species.matTune){
+    finMatOpts.roughness = Math.max(0.2, species.matTune.roughness);
+    if (sharedEnvMap){ finMatOpts.envMap = sharedEnvMap; finMatOpts.envMapIntensity = 0.6; }
+  }
+  const finMat = new THREE.MeshStandardMaterial(finMatOpts);
+  const tailScale = species.tailScale || 1;
+  const tailFinGeo = makeDetailedFinGeometry([
+    [0,0,0],
+    [0, height*0.65*tailScale, length*0.24*tailScale],
+    [0, 0, length*0.1*tailScale],
+    [0, -height*0.65*tailScale, length*0.24*tailScale]
+  ], species.finColor, {rayCount:6});
+  const tailFin = new THREE.Mesh(tailFinGeo, finMat);
+  tailFin.position.z = length*0.5;
+  tailFin.castShadow = true;
+
+  const dorsalGeo = makeDetailedFinGeometry([
+    [0,0,0],
+    [0, height*0.6, length*0.16],
+    [0, height*0.12, -length*0.14]
+  ], species.finColor, {rayCount:4});
+  const dorsal = new THREE.Mesh(dorsalGeo, finMat);
+  dorsal.position.z = -length*0.02;
+  dorsal.position.y = height*0.3;
+  dorsal.castShadow = true;
+
+  // eyes — a flattened gold iris ring around a flattened black pupil, seated flush against the head
+  const bEye = 0.1;
+  const eyeProf = profileAt(bEye);
+  const eyeZ = (bEye-0.5)*length;
+  const eyeY = eyeProf.halfH*0.32;
+  const eyeR = Math.max(0.01, Math.min(height*0.095, length*0.065));
+  const irisMat = new THREE.MeshStandardMaterial({color:0xcf9a3d, roughness:0.4, metalness:0.15});
+  const pupilMat = new THREE.MeshStandardMaterial({color:0x0a0a0a, roughness:0.2});
+  const glintMat = new THREE.MeshStandardMaterial({color:0xffffff, roughness:0.05, emissive:0xaad4e0, emissiveIntensity:0.4});
+  const eyesGroup = new THREE.Group();
+  [-1,1].forEach(side=>{
+    const ex = side*eyeProf.halfW*0.9;
+    const iris = new THREE.Mesh(new THREE.SphereGeometry(eyeR,14,12), irisMat);
+    iris.scale.set(0.3,1,1); // flattened along the outward axis so it sits flush, not bulging
+    iris.position.set(ex, eyeY, eyeZ);
+    const pupil = new THREE.Mesh(new THREE.SphereGeometry(eyeR*0.56,12,10), pupilMat);
+    pupil.scale.set(0.35,1,1);
+    pupil.position.set(ex + side*eyeR*0.13, eyeY, eyeZ); // barely proud of the iris
+    const glint = new THREE.Mesh(new THREE.SphereGeometry(eyeR*0.14,6,6), glintMat);
+    glint.position.set(ex + side*eyeR*0.24, eyeY+eyeR*0.32, eyeZ-eyeR*0.25);
+    const glint2 = new THREE.Mesh(new THREE.SphereGeometry(eyeR*0.07,6,6), glintMat);
+    glint2.position.set(ex + side*eyeR*0.19, eyeY-eyeR*0.22, eyeZ-eyeR*0.1); // smaller secondary highlight, opposite corner
+    eyesGroup.add(iris, pupil, glint, glint2);
+  });
+
+  // gill slits — a distinct dark curved line on each cheek, marking the operculum edge
+  const bGill = 0.19;
+  const gillProf = profileAt(bGill);
+  const gillZ = (bGill-0.5)*length;
+  const gillScale = species.gillScale || 1;
+  const gillMat = new THREE.MeshStandardMaterial({color:0x180a0a, roughness:0.65, transparent:true, opacity:0.85, side:THREE.DoubleSide});
+  const gillGeo = makeFinGeometry([
+    [0,0,0],
+    [0, gillProf.halfH*0.8*gillScale, length*0.025],
+    [0, gillProf.halfH*0.1*gillScale, length*0.06],
+    [0, -gillProf.halfH*0.8*gillScale, length*0.025]
+  ]);
+  const gillsGroup = new THREE.Group();
+  [-1,1].forEach(side=>{
+    const g = new THREE.Mesh(gillGeo, gillMat);
+    g.position.set(side*gillProf.halfW*0.99, 0, gillZ);
+    g.rotation.y = side>0 ? Math.PI/2 : -Math.PI/2;
+    gillsGroup.add(g);
+  });
+
+  // pectoral fins — paired, lateral, just behind the gills
+  const bPec = 0.25;
+  const pecProf = profileAt(bPec);
+  const pecZ = (bPec-0.5)*length;
+  const pecExtent = pecProf.halfW;
+  const pecGeo = makeDetailedFinGeometry([
+    [0,0,0],
+    [pecExtent*0.55, height*0.05, -length*0.012],
+    [pecExtent*0.65, -height*0.18, length*0.025],
+    [pecExtent*0.35, -height*0.28, length*0.065]
+  ], species.finColor, {rayCount:4, billow:0.6});
+  const pectoralsGroup = new THREE.Group();
+  [-1,1].forEach(side=>{
+    const p = new THREE.Mesh(pecGeo, finMat);
+    p.position.set(side*pecProf.halfW*0.88, -pecProf.halfH*0.05, pecZ);
+    p.scale.x = side;
+    p.castShadow = true;
+    pectoralsGroup.add(p);
+  });
+
+  // anal fin — single, ventral midline, behind the belly
+  const analGeo = makeDetailedFinGeometry([
+    [0,0,0],
+    [0, -height*0.48, length*0.13],
+    [0, -height*0.08, -length*0.09]
+  ], species.finColor, {rayCount:4});
+  const anal = new THREE.Mesh(analGeo, finMat);
+  anal.position.set(0, -height*0.26, length*0.06);
+  anal.castShadow = true;
+
+  // mouth — a small dark line at the tip of the snout
+  const mouthMat = new THREE.MeshStandardMaterial({color:0x241212, roughness:0.6});
+  const mouthGeo = new THREE.SphereGeometry(Math.max(0.008, width*0.11), 8, 6);
+  const mouth = new THREE.Mesh(mouthGeo, mouthMat);
+  mouth.scale.set(1, 0.22, 0.55);
+  const bMouth = 0.02;
+  const mouthProf = profileAt(bMouth);
+  mouth.position.set(0, -mouthProf.halfH*0.1, (bMouth-0.5)*length - width*0.05);
+
+  const inner = new THREE.Group();
+  inner.add(mesh, tailFin, dorsal, eyesGroup, gillsGroup, pectoralsGroup, anal, mouth);
+  inner.rotation.y = Math.PI; // Object3D.lookAt() faces +Z for non-camera objects; this corrects head-first orientation
+  const group = new THREE.Group();
+  group.add(inner);
+  group.userData = {mesh, tailFin};
+  return group;
+}
+function updateFishBody(group, t){
+  const {mesh, tailFin, undFreq, undAmp} = group.userData;
+  const geo = mesh.geometry;
+  const {basePositions, bValues} = mesh.userData;
+  const arr = geo.attributes.position.array;
+  for(let i=0;i<bValues.length;i++){
+    const b = bValues[i];
+    const dx = Math.sin(t*undFreq - b*6.0)*undAmp*Math.pow(b,1.6);
+    arr[i*3] = basePositions[i*3] + dx;
+  }
+  geo.attributes.position.needsUpdate = true;
+  const tailDx = Math.sin(t*undFreq - 1.15*6.0)*undAmp*Math.pow(1.15,1.6);
+  tailFin.position.x = tailDx;
+}
+
+// species presets
+const SPECIES = {
+  clownfish: {
+    heightScale:0.34, widthScale:0.24, finColor:'#ff9a3d', tailScale:1, detailMult:1.41,
+    behavior: { anchored:true, turnAgility:0.22 },
+    colorFn:(c,b,cyN)=>{
+      const stripe = (b>0.12&&b<0.24)||(b>0.42&&b<0.54)||(b>0.72&&b<0.84);
+      const edge = (b>0.10&&b<0.12)||(b>0.24&&b<0.26)||(b>0.40&&b<0.42)||(b>0.54&&b<0.56)||(b>0.70&&b<0.72)||(b>0.84&&b<0.86);
+      if (edge) c.set(0x2a1508);
+      else if (stripe) c.set(0xfaf6ea);
+      else c.set(0xff7a1f);
+      const shade = 1 - Math.max(0,-cyN)*0.25;
+      c.multiplyScalar(shade);
+    }
+  },
+  angelfish: {
+    heightScale:0.62, widthScale:0.16, finColor:'#f2d98a', tailScale:1.3, gillScale:0.85, detailMult:2.0,
+    behavior: { upperBias:0.06 },
+    matTune: { roughness:0.16, clearcoat:0.85, clearcoatRoughness:0.08, envMapIntensity:1.3 },
+    colorFn:(c,b,cyN)=>{
+      const dark = new THREE.Color(0x1c2621), light = new THREE.Color(0xe8ddc0), sheen = new THREE.Color(0x8fd9c9);
+      const bandCenters = [0.16, 0.34, 0.6];
+      let bandT = 0;
+      bandCenters.forEach(bc=>{
+        const t = Math.max(0, 1-Math.abs(b-bc)/0.05);
+        bandT = Math.max(bandT, t*t*(3-2*t));
+      });
+      c.copy(light).lerp(dark, bandT);
+      c.lerp(sheen, Math.max(0,cyN)*0.22*(1-bandT*0.6));
+      const speck = Math.sin(b*47+cyN*31)*Math.cos(cyN*23-b*19);
+      c.multiplyScalar(1+speck*0.035);
+    }
+  },
+  neonTetra: {
+    heightScale:0.22, widthScale:0.16, finColor:'#ffcbb0', tailScale:0.85,
+    behavior: { schooling:true, shelterBias:true },
+    colorFn:(c,b,cyN)=>{
+      const stripe = cyN > 0.0 && cyN < 0.45 && b > 0.05 && b <= 1.0;
+      const redZone = cyN <= 0.0 && cyN > -0.65 && b > 0.32 && b <= 1.0;
+      if (stripe) c.set(0x35d8e0);
+      else if (redZone) c.set(0xef3a1c);
+      else if (cyN > 0.45) c.set(0x3c4640);
+      else c.set(0xe9e6d8);
+    }
+  },
+  guppy: {
+    heightScale:0.26, widthScale:0.18, finColor:'#ff6fa3', tailScale:1.9,
+    behavior: { upperBias:0.14, erratic:true, shelterBias:true },
+    colorFn:(c,b,cyN)=>{
+      const hue = 0.85 - b*0.15;
+      c.setHSL(hue, 0.75, 0.6 - Math.max(0,-cyN)*0.15);
+    }
+  },
+  kuhliLoach: {
+    heightScale:0.13, widthScale:0.15, finColor:'#8a6a45', tailScale:0.6,
+    behavior: { shelterBias:true },
+    colorFn:(c,b,cyN)=>{
+      const baseCol = new THREE.Color(0xc9a15f), darkCol = new THREE.Color(0x2a1a0f);
+      const bandT = Math.pow(Math.sin(b*46)*0.5+0.5, 6); // many narrow dark bands along a long slender body
+      c.copy(baseCol).lerp(darkCol, bandT);
+      c.multiplyScalar(1 - Math.max(0,-cyN)*0.15);
+    }
+  },
+  germanBlueRam: {
+    heightScale:0.42, widthScale:0.24, finColor:'#f0a83a', tailScale:1.1,
+    behavior: {},
+    colorFn:(c,b,cyN)=>{
+      const blueBody = new THREE.Color(0x3a7a8a), yellowHead = new THREE.Color(0xe8b23a), black = new THREE.Color(0x181410);
+      const headT = Math.max(0, 1 - b/0.22);
+      c.copy(blueBody).lerp(yellowHead, headT);
+      const eyeStripe = Math.max(0, 1-Math.abs(b-0.09)/0.025);
+      c.lerp(black, eyeStripe*eyeStripe);
+      const spotB = Math.max(0, 1-Math.abs(b-0.48)/0.06);
+      const spotCy = Math.max(0, 1-Math.abs(cyN)/0.5);
+      c.lerp(black, spotB*spotCy*0.85);
+      const speck = Math.sin(b*61+cyN*37)*Math.cos(cyN*44-b*29);
+      if (speck > 0.75) c.lerp(new THREE.Color(0xd42a1c), 0.6);
+      c.multiplyScalar(1 - Math.max(0,-cyN)*0.1);
+    }
+  },
+  scarletBadis: {
+    heightScale:0.26, widthScale:0.17, finColor:'#d84a3a', tailScale:0.8,
+    behavior: { shelterBias:true },
+    colorFn:(c,b,cyN)=>{
+      const red = new THREE.Color(0xd81f1f), blue = new THREE.Color(0x2f5fbf);
+      const barT = Math.pow(Math.sin(b*20+1.2)*0.5+0.5, 5);
+      c.copy(red).lerp(blue, barT*0.8);
+      c.multiplyScalar(1 - Math.max(0,-cyN)*0.12);
+    }
+  },
+  betta: {
+    heightScale:0.34, widthScale:0.2, finColor:'#c81e3a', tailScale:2.8,
+    behavior: { anchored:true },
+    colorFn:(c,b,cyN)=>{
+      const red = new THREE.Color(0xc81e3a), blue = new THREE.Color(0x2a3ecf), purple = new THREE.Color(0x6a1fb0);
+      c.copy(red).lerp(blue, b*0.6).lerp(purple, Math.max(0,cyN)*0.3);
+      c.multiplyScalar(1 - Math.max(0,-cyN)*0.1);
+    }
+  },
+  discus: {
+    heightScale:0.88, widthScale:0.12, tailScale:0.7, finColor:'#3a6a9a',
+    behavior: { schooling:true },
+    colorFn:(c,b,cyN)=>{
+      const base = new THREE.Color(0x4a86b0), stripe = new THREE.Color(0x8a3a2a), fin = new THREE.Color(0xd4a83a);
+      c.copy(base);
+      const barPattern = Math.pow(Math.sin(b*11)*0.5+0.5, 4);
+      c.lerp(stripe, barPattern*0.5);
+      c.lerp(fin, Math.max(0,-cyN)*0.15);
+    }
+  },
+  cherryBarb: {
+    heightScale:0.28, widthScale:0.17, finColor:'#e8384a', tailScale:1.1,
+    behavior: { schooling:true },
+    colorFn:(c,b,cyN)=>{
+      c.setHSL(0.98, 0.75, 0.5 - Math.max(0,-cyN)*0.12);
+    }
+  },
+  harlequinRasbora: {
+    heightScale:0.3, widthScale:0.18, finColor:'#e8845a', tailScale:1.0,
+    behavior: { schooling:true },
+    colorFn:(c,b,cyN)=>{
+      const copper = new THREE.Color(0xe8845a), black = new THREE.Color(0x151210);
+      c.copy(copper);
+      const wedgeT = smooth01(0.45,0.65,b) * (1-smooth01(0.9,1,b));
+      const wedgeCy = 1-Math.abs(cyN)*0.6;
+      c.lerp(black, wedgeT*wedgeCy*0.85);
+    }
+  },
+  serpaeTetra: {
+    heightScale:0.26, widthScale:0.16, finColor:'#1a1512', tailScale:1.3,
+    behavior: { schooling:true, erratic:true },
+    colorFn:(c,b,cyN)=>{
+      const red = new THREE.Color(0xa8182a), dark = new THREE.Color(0x2a0f10);
+      c.copy(red);
+      c.multiplyScalar(1-Math.max(0,-cyN)*0.15);
+      const spotT = Math.max(0, 1-Math.abs(b-0.16)/0.05);
+      c.lerp(dark, spotT*0.6);
+    }
+  },
+  swordtail: {
+    heightScale:0.3, widthScale:0.19, finColor:'#e8621a', tailScale:1.4,
+    behavior: { upperBias:0.08 },
+    colorFn:(c,b,cyN)=>{
+      const green = new THREE.Color(0x3a7a4a), orange = new THREE.Color(0xd8621a), stripe = new THREE.Color(0xa8182a);
+      c.copy(green).lerp(orange, 0.3);
+      const stripeT = Math.max(0, 1-Math.abs(cyN)/0.25);
+      c.lerp(stripe, stripeT*0.5);
+    }
+  },
+  honeyGourami: {
+    heightScale:0.42, widthScale:0.17, finColor:'#e8a838', tailScale:0.9,
+    behavior: { upperBias:0.1 },
+    colorFn:(c,b,cyN)=>{
+      const gold = new THREE.Color(0xe8a838), amber = new THREE.Color(0xc87a1a), dark = new THREE.Color(0x6a3a10);
+      c.copy(gold).lerp(amber, Math.max(0,-cyN)*0.4);
+      const bandT = Math.max(0, 1-Math.abs(cyN)/0.15); // subtle darker midline band
+      c.lerp(dark, bandT*0.25);
+      c.multiplyScalar(1 - Math.max(0,-cyN)*0.08);
+    }
+  },
+  emberTetra: {
+    heightScale:0.2, widthScale:0.14, finColor:'#e8481a', tailScale:1.0,
+    behavior: { schooling:true },
+    colorFn:(c,b,cyN)=>{
+      c.setHSL(0.045, 0.85, 0.55 - Math.max(0,-cyN)*0.1);
+    }
+  },
+  chiliRasbora: {
+    heightScale:0.2, widthScale:0.14, finColor:'#c8283a', tailScale:0.9,
+    behavior: { schooling:true },
+    colorFn:(c,b,cyN)=>{
+      const red = new THREE.Color(0xd8283a), darkStripe = new THREE.Color(0x5a1018);
+      c.copy(red);
+      const stripeT = Math.max(0, 1-Math.abs(cyN)/0.12); // single narrow dark line along the midline
+      c.lerp(darkStripe, stripeT*0.6);
+    }
+  },
+  redPlaty: {
+    heightScale:0.34, widthScale:0.2, finColor:'#d8321a', tailScale:1.0,
+    behavior: { upperBias:0.06 },
+    colorFn:(c,b,cyN)=>{
+      const red = new THREE.Color(0xd8321a), lightBelly = new THREE.Color(0xe8a878);
+      c.copy(red).lerp(lightBelly, Math.max(0,-cyN)*0.3);
+    }
+  },
+  zebrafish: {
+    heightScale:0.22, widthScale:0.15, finColor:'#2a4a7a', tailScale:1.0,
+    behavior: { schooling:true, erratic:true },
+    colorFn:(c,b,cyN)=>{
+      const silver = new THREE.Color(0xd8dfe8), blue = new THREE.Color(0x2a4a7a);
+      const stripePattern = Math.sin(cyN*14)*0.5+0.5; // horizontal bands, running the length of the body
+      c.copy(silver).lerp(blue, Math.pow(stripePattern,2));
+    }
+  }
+};
+
+// the back grass shelter clumps live at these spots — small fish with shelterBias steer toward them
+const shelterSpots = [
+  new THREE.Vector3(-6.1, 0.35, -1.15), new THREE.Vector3(-6.2, 0.2, 0.15), // flatter shelter — lower target height
+  new THREE.Vector3(0.1, 0.35, -1.15), new THREE.Vector3(0, 0.4, 0.15),
+  new THREE.Vector3(6.3, 0.35, -1.15), new THREE.Vector3(6.2, 0.2, 0.15), // flatter shelter — lower target height
+];
+function nearestShelterSpot(pos){
+  let best = shelterSpots[0], bestD = Infinity;
+  for(const s of shelterSpots){ const d = pos.distanceTo(s); if (d < bestD){ bestD = d; best = s; } }
+  return best;
+}
+
+// a small scatter of disturbed sand — spawned when a kuhli loach digs/forages in the substrate
+let sandPuffs = [];
+function spawnSandPuff(x, y, z){
+  const count = 6+Math.floor(Math.random()*4);
+  for(let i=0;i<count;i++){
+    const geo = new THREE.SphereGeometry(0.012+Math.random()*0.01, 4, 3);
+    const mat = new THREE.MeshStandardMaterial({color:0xcdb896, roughness:1, transparent:true, opacity:0.85});
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(x, y, z);
+    scene.add(mesh);
+    const ang = Math.random()*Math.PI*2;
+    const speed = 0.15+Math.random()*0.25;
+    sandPuffs.push({
+      mesh,
+      vel: new THREE.Vector3(Math.cos(ang)*speed, 0.15+Math.random()*0.2, Math.sin(ang)*speed),
+      age: 0,
+      duration: 0.5+Math.random()*0.4
+    });
+  }
+}
+function updateSandPuffs(dt){
+  sandPuffs.forEach(p=>{
+    p.age += dt;
+    p.vel.y -= dt*0.4; // gently settles back down, like real disturbed sediment
+    p.mesh.position.addScaledVector(p.vel, dt);
+    p.mesh.material.opacity = 0.85*(1-Math.min(1, p.age/p.duration));
+  });
+  const surviving = [];
+  sandPuffs.forEach(p=>{
+    if (p.age >= p.duration){ scene.remove(p.mesh); p.mesh.geometry.dispose(); p.mesh.material.dispose(); }
+    else surviving.push(p);
+  });
+  sandPuffs = surviving;
+}
+
+// ---------------------------------------------------------------
+// DAY/NIGHT CLOCK & FEEDING — 1 real hour = 24 tank hours; once per tank day, food is
+// sprinkled at the surface and the fish come up to eat. The feeding event itself plays
+// out in real time (a fixed real-second duration) so it's actually watchable, even though
+// the day/night clock underneath it is running much faster than real time.
+// ---------------------------------------------------------------
+const TANK_TIME_SCALE = 24;       // tank seconds per real second (1 real hr = 24 tank hrs)
+const TANK_DAY_SECONDS = 86400;   // one full tank day, in tank-seconds
+const FEEDING_DURATION = 28;      // real seconds the feeding event lasts
+let tankSeconds = 0;
+let darwinClockSeconds = 0; // separate accelerated clock for day/night + displayed time in Darwin mode
+let lastFeedDay = 0;
+let feedingActive = false;
+let feedingTimer = 0;
+let foodFlakes = [];
+
+class FoodFlake {
+  constructor(x, z){
+    this.pos = new THREE.Vector3(x, H-0.12, z);
+    this.sinkSpeed = 0.035+Math.random()*0.03;
+    this.wobble = Math.random()*20;
+    this.eaten = false;
+    this.landed = false;
+    this.restTimer = 0;
+    const geo = new THREE.SphereGeometry(0.018+Math.random()*0.012, 6, 5);
+    this.mat = new THREE.MeshStandardMaterial({color:0x8a6a3f, roughness:0.75, emissive:0x000000});
+    this.mesh = new THREE.Mesh(geo, this.mat);
+    this.mesh.scale.set(1, 0.4, 1);
+    this.mesh.position.copy(this.pos);
+    scene.add(this.mesh);
+  }
+  update(dt, t){
+    if (this.eaten) return;
+    if (!this.landed){
+      this.pos.y -= this.sinkSpeed*dt;
+      this.pos.x += Math.sin(t*1.4+this.wobble)*0.0025;
+      this.pos.z += Math.cos(t*1.1+this.wobble)*0.0025;
+      this.mesh.position.copy(this.pos);
+      if (this.pos.y < 0.1){ this.pos.y = 0.1; this.mesh.position.y = 0.1; this.landed = true; }
+    } else {
+      this.restTimer += dt;
+      if (this.restTimer > 50) { this.consume(); return; } // eventually decays if never found
+    }
+    // a soft twinkle so a leftover flake still catches the eye while it drifts or rests
+    const tw = Math.max(0, Math.sin(t*5+this.wobble)) * Math.max(0, Math.sin(t*2.3+this.wobble*1.7));
+    const glow = tw*0.55;
+    this.mat.emissive.setRGB(glow, glow*0.88, glow*0.55);
+  }
+  consume(){
+    if (this.eaten) return;
+    this.eaten = true;
+    scene.remove(this.mesh);
+  }
+}
+function findNearestFood(pos, maxDist){
+  maxDist = maxDist===undefined ? Infinity : maxDist;
+  let best = null, bestD = Infinity;
+  for(const f of foodFlakes){
+    if (f.eaten) continue;
+    const d = pos.distanceTo(f.pos);
+    if (d < bestD && d <= maxDist){ bestD = d; best = f; }
+  }
+  return best;
+}
+function startFeeding(){
+  feedingActive = true;
+  feedingTimer = FEEDING_DURATION;
+  const count = 24;
+  for(let i=0;i<count;i++){
+    const x = (Math.random()-0.5)*(W-1.2);
+    const z = (Math.random()-0.5)*(D-0.6);
+    foodFlakes.push(new FoodFlake(x, z));
+  }
+}
+function updateFeeding(dt, t){
+  tankSeconds += dt*TANK_TIME_SCALE;
+  if (darwinMode) darwinClockSeconds += dt*TANK_TIME_SCALE*10;
+  const day = Math.floor(tankSeconds/TANK_DAY_SECONDS);
+  if (day > lastFeedDay){ lastFeedDay = day; startFeeding(); }
+
+  if (feedingActive){
+    feedingTimer -= dt;
+    if (feedingTimer <= 0) feedingActive = false; // stops the active rush; existing flakes keep drifting/resting
+  }
+  foodFlakes.forEach(f=>f.update(dt,t));
+  foodFlakes = foodFlakes.filter(f=>!f.eaten);
+}
+let currentLightLevel = 1;
+function updateDayNightLighting(){
+  const effectiveSeconds = darwinMode ? darwinClockSeconds : tankSeconds;
+  const dayProgress = (effectiveSeconds % TANK_DAY_SECONDS) / TANK_DAY_SECONDS; // 0..1 through the tank day
+  const brightness = 0.625 + 0.375*Math.cos(dayProgress*Math.PI*2); // 1.0 at peak, 0.25 at the darkest point
+  currentLightLevel = brightness;
+  ambientLight.intensity = baseLightIntensity.ambient * brightness;
+  topLight.intensity = baseLightIntensity.top * brightness;
+  glowFill.intensity = baseLightIntensity.glow * brightness;
+}
+// a first feeding shortly after load, so the feature is visible without waiting a full real hour
+// (this doesn't affect the regular once-per-tank-day schedule, which still starts counting from t=0)
+setTimeout(()=>{ if (!feedingActive) startFeeding(); }, 8000);
+
+// Darwin mode: lifespans in tank-days, converted to age-seconds in the constructor.
+// Small fish live shortest, large fish longest — loosely mirrors real relative lifespans.
+const DARWIN_LIFESPAN_DAYS = {
+  neonTetra:[0.35,0.6], guppy:[0.35,0.6], scarletBadis:[0.35,0.6],
+  cherryBarb:[0.35,0.6], harlequinRasbora:[0.35,0.6], serpaeTetra:[0.35,0.6], emberTetra:[0.35,0.6],
+  chiliRasbora:[0.35,0.6], zebrafish:[0.35,0.6],
+  kuhliLoach:[0.55,0.85], germanBlueRam:[0.55,0.85], betta:[0.55,0.85], swordtail:[0.45,0.7], honeyGourami:[0.55,0.85], redPlaty:[0.45,0.7],
+  clownfish:[0.75,1.2], angelfish:[0.75,1.2], discus:[0.75,1.2]
+};
+const DARWIN_PREDATORS = ['clownfish','angelfish'];
+const DARWIN_PREY = ['neonTetra','guppy','scarletBadis','cherryBarb','harlequinRasbora','serpaeTetra','emberTetra','chiliRasbora','zebrafish'];
+const GROWTH_STAGE_SCALE = [0.15, 0.4, 0.7, 1.0]; // egg/fry, juvenile, sub-adult, adult
+const SPECIES_LENGTH_RANGE = {
+  clownfish:[0.36,0.42], angelfish:[0.44,0.5], neonTetra:[0.16,0.21], guppy:[0.14,0.18],
+  kuhliLoach:[0.32,0.38], germanBlueRam:[0.22,0.28], scarletBadis:[0.08,0.11],
+  betta:[0.28,0.34], discus:[0.38,0.46], cherryBarb:[0.16,0.2],
+  harlequinRasbora:[0.15,0.19], serpaeTetra:[0.15,0.19], swordtail:[0.22,0.28],
+  honeyGourami:[0.24,0.3], emberTetra:[0.08,0.11],
+  chiliRasbora:[0.08,0.11], redPlaty:[0.2,0.26], zebrafish:[0.16,0.2]
+};
+const SPECIES_DEFAULT_COUNT = {
+  clownfish:3, angelfish:2, neonTetra:8, guppy:4, kuhliLoach:4, germanBlueRam:4, scarletBadis:6,
+  betta:1, discus:3, cherryBarb:6, harlequinRasbora:7, serpaeTetra:6, swordtail:3,
+  honeyGourami:2, emberTetra:8,
+  chiliRasbora:8, redPlaty:3, zebrafish:7
+};
+class Fish {
+  constructor(speciesKey, length){
+    const species = SPECIES[speciesKey];
+    this.speciesKey = speciesKey;
+    this.behavior = species.behavior || {};
+    this.group = buildFishBody(length, species);
+    this.group.userData.undFreq = 4.2+Math.random()*1.4;
+    this.group.userData.undAmp = 0.05+Math.random()*0.02;
+    const spawnY = speciesKey==='kuhliLoach' ? 0.15+Math.random()*0.2 : 0.5+Math.random()*(H-1.2);
+    this.pos = new THREE.Vector3((Math.random()-0.5)*(W-0.8), spawnY, (Math.random()-0.5)*(D-0.6));
+    const ang = Math.random()*Math.PI*2;
+    this.vel = new THREE.Vector3(Math.cos(ang), (Math.random()-0.5)*0.2, Math.sin(ang)*0.6).normalize().multiplyScalar(0.22+Math.random()*0.16);
+    this.wanderTimer = Math.random()*3;
+    this.phase = Math.random()*20;
+    this.bobPhase = Math.random()*10;
+    this.lastPeckTilt = 0;
+    this.burstTimer = 0;
+    this.state = 'cruise';
+    this.foodTarget = null;
+    this.digTimer = 3+Math.random()*6;
+    this.digging = false;
+    this.digDuration = 0;
+    this.hideTimer = 8+Math.random()*12;
+    this.hiding = false;
+    this.hideDuration = 0;
+    this.hideTarget = null;
+    this.hideElapsed = 0;
+    this.grazeTimer = 15+Math.random()*20;
+    this.grazing = false;
+    this.grazeElapsed = 0;
+    this.grazeDuration = 0;
+    this.grazeWallX = 0;
+    this.grazeTargetY = 0.5;
+    this.grazeDir = 1;
+    this.age = 0;
+    const lifespanRange = DARWIN_LIFESPAN_DAYS[speciesKey] || [0.5,1.0];
+    this.lifespanSeconds = (lifespanRange[0]+Math.random()*(lifespanRange[1]-lifespanRange[0])) * TANK_DAY_SECONDS;
+    this.growthStage = 3; // adult by default
+    this.growthTimer = 0;
+    if (this.behavior.anchored){
+      const clearance = 0.8;
+      this.anchor = new THREE.Vector3(
+        THREE.MathUtils.clamp(this.pos.x, -HALF_W+clearance, HALF_W-clearance),
+        this.pos.y,
+        THREE.MathUtils.clamp(this.pos.z, -HALF_D+clearance, HALF_D-clearance)
+      );
+    }
+    this.group.position.copy(this.pos);
+    scene.add(this.group);
+  }
+  updateKuhliGraze(dt){
+    if (this.grazing){
+      this.grazeElapsed = (this.grazeElapsed||0) + dt;
+      if (this.grazeElapsed > 40){ this.grazing = false; return false; } // stuck safety net
+      const wallX = this.grazeWallX;
+      const distToWall = Math.abs(this.pos.x - wallX);
+      if (distToWall > 0.4){
+        const dir = new THREE.Vector3(wallX-this.pos.x, this.grazeTargetY-this.pos.y, -this.pos.z*0.5).normalize();
+        this.vel.lerp(dir.multiplyScalar(0.45), 0.18); // still traveling to the wall
+      } else {
+        // grazing: pinned near the glass, slow deliberate vertical drift (not random bobbing)
+        this.vel.x = THREE.MathUtils.clamp((wallX-this.pos.x)*2, -0.25, 0.25);
+        this.vel.y = this.grazeDir*0.07;
+        this.vel.z *= 0.9;
+        if (this.pos.y > H*0.78){ this.grazeDir = -1; }
+        if (this.pos.y < 0.15){ this.grazeDir = 1; }
+        this.grazeDuration -= dt;
+        if (this.grazeDuration <= 0) this.grazing = false;
+      }
+      return true;
+    }
+    this.grazeTimer -= dt;
+    if (this.grazeTimer <= 0){
+      this.grazeTimer = 25+Math.random()*25;
+      this.grazing = true;
+      this.grazeElapsed = 0;
+      this.grazeWallX = this.pos.x < 0 ? -HALF_W+0.2 : HALF_W-0.2;
+      this.grazeTargetY = 0.3+Math.random()*(H*0.55);
+      this.grazeDir = Math.random()<0.5 ? 1 : -1;
+      this.grazeDuration = 5+Math.random()*6;
+      return true;
+    }
+    return false;
+  }
+  updateKuhliHide(dt){
+    if (this.hiding){
+      this.hideElapsed = (this.hideElapsed||0) + dt;
+      const toSpot = this.hideTarget.clone().sub(this.pos);
+      const dist = toSpot.length();
+      if (dist > 0.2){
+        if (this.hideElapsed > 8){ this.hiding = false; return false; } // stuck safety net — give up and resume normal behavior
+        this.vel.lerp(toSpot.normalize().multiplyScalar(0.32), 0.15); // still traveling there
+        return true;
+      }
+      this.vel.multiplyScalar(0.85); // arrived — settle and linger
+      this.hideDuration -= dt;
+      if (this.hideDuration <= 0) this.hiding = false;
+      return true;
+    }
+    this.hideTimer -= dt;
+    if (this.hideTimer <= 0){
+      this.hideTimer = 10+Math.random()*16;
+      let target = null;
+      if (rockObstacles.length && Math.random() < 0.6){
+        let candidates = rockObstacles.filter(o => this.pos.distanceTo(o.position) < 4.5);
+        if (!candidates.length) candidates = rockObstacles;
+        const obs = candidates[Math.floor(Math.random()*candidates.length)];
+        // try several angles around the target rock, and only accept one that's also
+        // clear of every OTHER nearby rock — otherwise the fish gets caught fighting
+        // two conflicting avoidance forces at once and can get stuck between them
+        const offsetDist = obs.radius + 0.15;
+        let found = null;
+        for(let attempt=0; attempt<8 && !found; attempt++){
+          const ang = Math.random()*Math.PI*2;
+          const candidate = new THREE.Vector3(obs.position.x+Math.cos(ang)*offsetDist, 0.12, obs.position.z+Math.sin(ang)*offsetDist);
+          const clear = rockObstacles.every(other => other===obs || candidate.distanceTo(other.position) > other.radius+0.4);
+          if (clear) found = candidate;
+        }
+        target = found; // null if no clear angle was found after all attempts
+      }
+      if (!target){
+        target = nearestShelterSpot(this.pos).clone();
+        target.y = Math.min(target.y, 0.2);
+      }
+      this.hiding = true;
+      this.hideElapsed = 0;
+      this.hideDuration = 3+Math.random()*4;
+      this.hideTarget = target;
+      return true;
+    }
+    return false;
+  }
+  updateKuhliDig(dt){
+    if (this.digging){
+      this.digDuration -= dt;
+      this.vel.multiplyScalar(0.88);
+      if (this.digDuration <= 0) this.digging = false;
+      return true;
+    }
+    this.digTimer -= dt;
+    if (this.digTimer <= 0){
+      if (this.pos.y < 0.15){
+        this.digging = true;
+        this.digDuration = 0.6+Math.random()*0.5;
+        this.digTimer = 6+Math.random()*9;
+        spawnSandPuff(this.pos.x, 0.06, this.pos.z);
+        this.vel.multiplyScalar(0.4);
+        return true;
+      }
+      this.digTimer = 1+Math.random()*2; // not near the bottom yet — check again soon
+    }
+    return false;
+  }
+  update(dt, t){
+    const beh = this.behavior;
+
+    if (this.state === 'cruise'){
+      let digging = false;
+      if (this.speciesKey === 'kuhliLoach'){
+        if (this.digging) digging = this.updateKuhliDig(dt);
+        else if (this.hiding) digging = this.updateKuhliHide(dt);
+        else if (this.grazing) digging = this.updateKuhliGraze(dt);
+        else digging = this.updateKuhliHide(dt) || this.updateKuhliDig(dt) || this.updateKuhliGraze(dt);
+        if (!digging){
+          // strongly prefer the bottom 10% of the tank — but only during plain patrol;
+          // this would otherwise fight directly against deliberately climbing the glass
+          const zoneTop = H*0.1;
+          if (this.pos.y > zoneTop) this.vel.y -= ((this.pos.y-zoneTop)/H)*7*dt;
+          // more likely than other fish to be at the front of the tank, foraging the sand there
+          const frontZoneBack = HALF_D*0.15;
+          if (this.pos.z < frontZoneBack) this.vel.z += ((frontZoneBack-this.pos.z)/D)*1.8*dt;
+        }
+      }
+      if (digging){
+        const maxSpeed = 0.4;
+        if (this.vel.length() > maxSpeed) this.vel.setLength(maxSpeed);
+      } else {
+      // notice food: eagerly during an active feeding rush, or opportunistically if a leftover flake is nearby
+      if (foodFlakes.length){
+        const noticeChance = feedingActive ? 0.3 : 0.05;
+        const noticeRange = feedingActive ? Infinity : 2.2;
+        if (Math.random() < noticeChance){
+          const target = findNearestFood(this.pos, noticeRange);
+          if (target){ this.state = 'feeding'; this.foodTarget = target; }
+        }
+      }
+      this.wanderTimer -= dt;
+      if (this.wanderTimer <= 0){
+        this.wanderTimer = 2.5+Math.random()*4;
+        let jitter;
+        if (beh.shelterBias && Math.random() < 0.4){
+          jitter = nearestShelterSpot(this.pos).clone().sub(this.pos).normalize();
+        } else {
+          jitter = new THREE.Vector3((Math.random()-0.5),(Math.random()-0.5)*0.4,(Math.random()-0.5)*0.6);
+          if (beh.erratic) jitter.multiplyScalar(1.9);
+          if (this.speciesKey === 'kuhliLoach') jitter.y *= 0.12;
+        }
+        this.vel.addScaledVector(jitter, 0.35).normalize().multiplyScalar(0.22+Math.random()*0.16);
+      }
+      // schooling: mild pull toward the local center and heading of nearby same-species fish
+      if (beh.schooling){
+        const avgPos = new THREE.Vector3(), avgVel = new THREE.Vector3();
+        let n = 0;
+        for(const other of fish){
+          if (other===this || other.speciesKey!==this.speciesKey) continue;
+          if (this.pos.distanceTo(other.pos) < 2.4){ avgPos.add(other.pos); avgVel.add(other.vel); n++; }
+        }
+        if (n>0){
+          avgPos.multiplyScalar(1/n); avgVel.multiplyScalar(1/n);
+          this.vel.addScaledVector(avgPos.sub(this.pos), 0.18*dt);
+          this.vel.addScaledVector(avgVel, 0.1*dt);
+        }
+      }
+      // territorial: gentle pull back toward home spot once it strays too far
+      if (beh.anchored && this.anchor){
+        const toAnchor = this.anchor.clone().sub(this.pos);
+        if (toAnchor.length() > 1.0) this.vel.addScaledVector(toAnchor.normalize(), 0.5*dt);
+      }
+      // depth preference (guppies/angelfish favor the upper water)
+      if (beh.upperBias) this.vel.y += beh.upperBias*dt*0.2;
+      // keep continuous small steering forces from accumulating into runaway speed
+      const maxSpeed = 0.4;
+      if (this.vel.length() > maxSpeed) this.vel.setLength(maxSpeed);
+      }
+
+    } else { // feeding: swim up to intercept a food flake and eat it
+      if (!this.foodTarget || this.foodTarget.eaten){
+        this.foodTarget = findNearestFood(this.pos);
+        if (!this.foodTarget){ this.state = 'cruise'; this.wanderTimer = 0.3; }
+      }
+      if (this.foodTarget){
+        const toTarget = this.foodTarget.pos.clone().sub(this.pos);
+        const dist = toTarget.length();
+        if (dist > 0.14){
+          this.vel.lerp(toTarget.normalize().multiplyScalar(0.32), 0.15);
+        } else {
+          this.foodTarget.consume();
+          this.foodTarget = null;
+        }
+      }
+      if (!feedingActive && !this.foodTarget){ this.state = 'cruise'; this.wanderTimer = 0.3; }
+    }
+
+    // steer away from tank walls (bottom margin relaxes while feeding near the surface is fine too)
+    const margin = this.speciesKey === 'kuhliLoach' ? 0.08 : 0.45;
+    const push = new THREE.Vector3();
+    if (this.pos.x < -HALF_W+margin) push.x += 1;
+    if (this.pos.x >  HALF_W-margin) push.x -= 1;
+    if (this.pos.y < margin) push.y += 1;
+    if (this.pos.y >  H-0.15) push.y -= 1; // let feeding fish get close to the surface
+    if (this.pos.z < -HALF_D+margin) push.z += 1;
+    if (this.pos.z >  HALF_D-margin) push.z -= 1;
+    if (push.lengthSq() > 0){
+      this.vel.addScaledVector(push, 1.4*dt*4);
+      this.vel.normalize().multiplyScalar(this.state==='feeding' ? 0.28 : 0.26);
+    }
+
+    // steer away from rocks — a soft repulsion field, stronger the closer the fish gets
+    for(let ri=0; ri<rockObstacles.length; ri++){
+      const obs = rockObstacles[ri];
+      const away = this.pos.clone().sub(obs.position);
+      const dist = away.length();
+      const safeDist = obs.radius + 0.35;
+      if (dist < safeDist && dist > 0.001){
+        const strength = (1 - dist/safeDist) * 3.6;
+        this.vel.addScaledVector(away.multiplyScalar(1/dist), strength * dt * 4);
+      }
+    }
+
+    // occasional burst of speed — a startled dart or playful spurt
+    if (this.burstTimer > 0){
+      this.burstTimer -= dt;
+    } else if (Math.random() < 0.0018){
+      this.burstTimer = 0.3+Math.random()*0.35;
+    }
+    const burstMult = this.burstTimer > 0 ? 2.0+Math.random()*0.7 : 1;
+
+    this.pos.addScaledVector(this.vel, dt*burstMult);
+    // hard constraint: the soft repulsion above can be outrun by a fast-moving fish (bursts,
+    // or a strong food-seeking pull) — this guarantees the fish's position can never actually
+    // end up inside a rock, regardless of what velocity got it there
+    for(let ri=0; ri<rockObstacles.length; ri++){
+      const obs = rockObstacles[ri];
+      const away = this.pos.clone().sub(obs.position);
+      const dist = away.length();
+      if (dist < obs.radius && dist > 0.001){
+        this.pos.copy(obs.position).addScaledVector(away.multiplyScalar(1/dist), obs.radius);
+      }
+    }
+    this.group.position.copy(this.pos);
+
+    const nibbling = this.state==='feeding' && this.foodTarget && this.foodTarget.pos.distanceTo(this.pos) <= 0.2;
+    if (nibbling) this.group.position.y += Math.sin(t*6+this.bobPhase)*0.02;
+
+    if (this.vel.lengthSq() > 0.0001){
+      const look = this.pos.clone().add(this.vel);
+      lookScratch.position.copy(this.group.position);
+      lookScratch.up.copy(this.group.up);
+      lookScratch.lookAt(look.x, look.y, look.z);
+      this.group.quaternion.slerp(lookScratch.quaternion, Math.min(1, dt*5));
+    }
+    if (this.lastPeckTilt) this.group.rotateX(-this.lastPeckTilt);
+    const peckTilt = nibbling ? (0.28+Math.sin(t*6+this.bobPhase)*0.07) : 0;
+    if (peckTilt) this.group.rotateX(peckTilt);
+    this.lastPeckTilt = peckTilt;
+
+    updateFishBody(this.group, t + this.phase);
+  }
+}
+
+const fish = [];
+function pickRandomSpeciesSet(){
+  const allKeys = Object.keys(SPECIES_DEFAULT_COUNT);
+  const shuffled = allKeys.slice().sort(()=>Math.random()-0.5);
+  const count = 5 + Math.floor(Math.random()*4); // 5-8 inclusive
+  return shuffled.slice(0, count);
+}
+pickRandomSpeciesSet().forEach(key=>{
+  const n = SPECIES_DEFAULT_COUNT[key];
+  const [lo,hi] = SPECIES_LENGTH_RANGE[key];
+  for(let i=0;i<n;i++) fish.push(new Fish(key, lo+Math.random()*(hi-lo)));
+});
+
+// ---------------------------------------------------------------
+// FISH CAM — press F to follow a random fish from behind, F again to stop
+// ---------------------------------------------------------------
+const SPECIES_DISPLAY = { clownfish:'CLOWNFISH', angelfish:'ANGELFISH', neonTetra:'NEON TETRA', guppy:'GUPPY', kuhliLoach:'KUHLI LOACH', germanBlueRam:'GERMAN BLUE RAM', scarletBadis:'SCARLET BADIS', betta:'BETTA', discus:'DISCUS', cherryBarb:'CHERRY BARB', harlequinRasbora:'HARLEQUIN RASBORA', serpaeTetra:'SERPAE TETRA', swordtail:'SWORDTAIL', honeyGourami:'HONEY GOURAMI', emberTetra:'EMBER TETRA', chiliRasbora:'CHILI RASBORA', redPlaty:'RED PLATY', zebrafish:'ZEBRAFISH' };
+
+// ---------------------------------------------------------------
+// RESTOCK PANEL — press R
+// ---------------------------------------------------------------
+const MAX_PER_SPECIES = 25;
+function disposeFishGroup(group){
+  group.traverse(obj=>{
+    if (obj.isMesh){
+      if (obj.geometry) obj.geometry.dispose();
+      if (obj.material){
+        if (Array.isArray(obj.material)) obj.material.forEach(m=>m.dispose());
+        else obj.material.dispose();
+      }
+    }
+  });
+}
+function countOfSpecies(key){ return fish.filter(f=>f.speciesKey===key).length; }
+function countOfAdults(key){ return fish.filter(f=>f.speciesKey===key && f.growthStage===3).length; }
+function addFishOfSpecies(key, asJuvenile){
+  if (countOfSpecies(key) >= MAX_PER_SPECIES) return;
+  const [lo,hi] = SPECIES_LENGTH_RANGE[key];
+  const f = new Fish(key, lo+Math.random()*(hi-lo));
+  if (asJuvenile){
+    f.growthStage = 0;
+    f.growthTimer = f.lifespanSeconds*0.1;
+    f.group.scale.setScalar(GROWTH_STAGE_SCALE[0]);
+  }
+  fish.push(f);
+}
+function removeFishAt(idx){
+  const f = fish[idx];
+  if (fishCamTarget === f){ fishCamActive = false; fishCamTarget = null; updateFishCamHUD(); }
+  scene.remove(f.group);
+  disposeFishGroup(f.group);
+  fish.splice(idx,1);
+}
+
+// corpses: a dead fish's own mesh is reused (not disposed) and falls to the bottom, where
+// any nearby fish can take bites, stepping the body down through visible decay stages
+// until nothing is left
+const CORPSE_DECAY_FRACTIONS = [1.0, 0.9, 0.75, 0.5, 0.25, 0];
+let corpses = [];
+class Corpse {
+  constructor(fishObj){
+    this.group = fishObj.group;
+    this.pos = fishObj.pos.clone();
+    this.baseScale = fishObj.group.scale.x;
+    this.decayStage = 0;
+    this.biteTimer = 1+Math.random();
+    this.group.rotation.z = 0;
+  }
+  update(dt){
+    if (this.pos.y > 0.08){
+      this.pos.y = Math.max(0.08, this.pos.y - 0.35*dt);
+      this.group.position.copy(this.pos);
+    }
+    // tip over to lie on its side as it settles — visually reads as dead, not swimming
+    if (this.group.rotation.z < Math.PI*0.42){
+      this.group.rotation.z = Math.min(Math.PI*0.42, this.group.rotation.z + dt*1.2);
+    }
+    this.biteTimer -= dt;
+    if (this.biteTimer <= 0 && this.decayStage < CORPSE_DECAY_FRACTIONS.length-1){
+      const eater = fish.find(f=>f.pos.distanceTo(this.pos) < 0.45);
+      this.decayStage++;
+      this.group.scale.setScalar(this.baseScale * CORPSE_DECAY_FRACTIONS[this.decayStage]);
+      this.biteTimer = eater ? (0.7+Math.random()*0.7) : (2.5+Math.random()*2.5);
+    }
+  }
+}
+function killFishToCorpse(idx){
+  const f = fish[idx];
+  if (fishCamTarget === f){ fishCamActive = false; fishCamTarget = null; updateFishCamHUD(); }
+  corpses.push(new Corpse(f));
+  fish.splice(idx,1);
+}
+function updateCorpses(dt){
+  corpses.forEach(c=>c.update(dt));
+  for(let i=corpses.length-1;i>=0;i--){
+    if (corpses[i].decayStage >= CORPSE_DECAY_FRACTIONS.length-1){
+      scene.remove(corpses[i].group);
+      disposeFishGroup(corpses[i].group);
+      corpses.splice(i,1);
+    }
+  }
+}
+function spawnPredationEffect(pos){
+  const geo = new THREE.RingGeometry(0.15, 0.22, 16);
+  const mat = new THREE.MeshBasicMaterial({color:0xdd3322, transparent:true, opacity:0.75, side:THREE.DoubleSide, depthWrite:false});
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.copy(pos);
+  mesh.rotation.x = Math.random()*Math.PI;
+  mesh.rotation.y = Math.random()*Math.PI;
+  scene.add(mesh);
+  bubblePops.push({mesh, age:0, duration:0.4, maxRadius:2.0});
+}
+function removeFishOfSpecies(key){
+  const idx = fish.map(f=>f.speciesKey).lastIndexOf(key);
+  if (idx === -1) return;
+  removeFishAt(idx);
+}
+
+// ---------------------------------------------------------------
+// DARWIN MODE — press D. Fish age and die, reproduce when 2+ of a species are present,
+// predators (clownfish, angelfish) can catch small prey, and population growth beyond the
+// starting count reduces reproduction odds (the daily feed only stretches so far).
+// ---------------------------------------------------------------
+let darwinMode = false;
+let darwinPredationChance = 0.01;
+let darwinAggressionChance = 0.006;
+let darwinStartingPopulation = null;
+let darwinReproTimer = 0;
+function buildDarwinBorder(){
+  const group = new THREE.Group();
+  const mat = new THREE.MeshBasicMaterial({color:0xff2222});
+  const thickness = 0.045;
+  const z = HALF_D + 0.01;
+  const hBar = new THREE.BoxGeometry(W+thickness*2, thickness, thickness);
+  const top = new THREE.Mesh(hBar, mat); top.position.set(0, H, z); group.add(top);
+  const bottom = new THREE.Mesh(hBar, mat); bottom.position.set(0, 0, z); group.add(bottom);
+  const vBar = new THREE.BoxGeometry(thickness, H, thickness);
+  const left = new THREE.Mesh(vBar, mat); left.position.set(-HALF_W, H/2, z); group.add(left);
+  const right = new THREE.Mesh(vBar, mat); right.position.set(HALF_W, H/2, z); group.add(right);
+  group.visible = false;
+  scene.add(group);
+  return group;
+}
+const darwinBorder = buildDarwinBorder();
+window.addEventListener('keydown', (e)=>{
+  if (e.key === 'd' || e.key === 'D'){
+    darwinMode = !darwinMode;
+    darwinBorder.visible = darwinMode;
+    if (darwinMode){ darwinStartingPopulation = fish.length; darwinClockSeconds = tankSeconds; }
+  }
+});
+function isPreyFor(target){
+  if (target.growthStage < 2) return true; // fry/juveniles of ANY species are vulnerable
+  return DARWIN_PREY.includes(target.speciesKey);
+}
+// ---------------------------------------------------------------
+// DARWIN SETTINGS PANEL — press P — sliders for predation/aggression odds
+// ---------------------------------------------------------------
+let darwinPanelActive = false;
+function buildDarwinPanel(){
+  const div = document.createElement('div');
+  div.id = 'darwinPanel';
+  div.style.cssText = 'display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); color:#eaf6ff; font-family:Georgia,"Times New Roman",serif; background:rgba(8,18,24,0.93); border:1px solid rgba(234,246,255,0.3); border-radius:10px; padding:20px 26px; z-index:25; min-width:300px; pointer-events:auto;';
+  const title = document.createElement('div');
+  title.textContent = 'DARWIN MODE SETTINGS';
+  title.style.cssText = 'font-size:16px; letter-spacing:1px; text-align:center; margin-bottom:16px;';
+  div.appendChild(title);
+
+  function addSlider(label, min, max, step, getVal, setVal){
+    const row = document.createElement('div');
+    row.style.cssText = 'margin-bottom:16px;';
+    const labelRow = document.createElement('div');
+    labelRow.style.cssText = 'display:flex; justify-content:space-between; font-size:13px; margin-bottom:5px;';
+    const labelSpan = document.createElement('span'); labelSpan.textContent = label;
+    const valueSpan = document.createElement('span'); valueSpan.style.cssText = 'font-variant-numeric:tabular-nums;'; valueSpan.textContent = (getVal()*100).toFixed(1)+'%';
+    labelRow.appendChild(labelSpan); labelRow.appendChild(valueSpan);
+    const slider = document.createElement('input');
+    slider.type = 'range'; slider.min = min; slider.max = max; slider.step = step; slider.value = getVal();
+    slider.style.cssText = 'width:100%; accent-color:#dd3322;';
+    slider.oninput = ()=>{
+      const v = parseFloat(slider.value);
+      setVal(v);
+      valueSpan.textContent = (v*100).toFixed(1)+'%';
+    };
+    row.appendChild(labelRow); row.appendChild(slider);
+    div.appendChild(row);
+  }
+
+  addSlider('Predation chance (per close encounter)', 0, 0.05, 0.001,
+    ()=>darwinPredationChance, v=>{ darwinPredationChance = v; });
+  addSlider('Aggression chance (overcrowded predators)', 0, 0.03, 0.0005,
+    ()=>darwinAggressionChance, v=>{ darwinAggressionChance = v; });
+
+  const footer = document.createElement('div');
+  footer.textContent = 'Press P to close';
+  footer.style.cssText = 'margin-top:4px; font-size:11px; opacity:0.65; text-align:center;';
+  div.appendChild(footer);
+  document.body.appendChild(div);
+  return div;
+}
+const darwinPanel = buildDarwinPanel();
+window.addEventListener('keydown', (e)=>{
+  if (e.key === 'p' || e.key === 'P'){
+    darwinPanelActive = !darwinPanelActive;
+    darwinPanel.style.display = darwinPanelActive ? 'block' : 'none';
+  }
+});
+
+function updateDarwinMode(dt){
+  const ageStep = dt*TANK_TIME_SCALE*10; // aging/growth/reproduction run at 10x normal tank speed
+  const dead = new Set();
+
+  // aging — natural death once a fish exceeds its randomized lifespan
+  fish.forEach(f=>{
+    f.age += ageStep;
+    if (f.age > f.lifespanSeconds) dead.add(f);
+  });
+
+  // growth — juveniles progress through 4 stages toward full adult size
+  fish.forEach(f=>{
+    if (dead.has(f) || f.growthStage >= 3) return;
+    f.growthTimer -= ageStep;
+    if (f.growthTimer <= 0){
+      f.growthStage++;
+      f.group.scale.setScalar(GROWTH_STAGE_SCALE[f.growthStage]);
+      f.growthTimer = f.lifespanSeconds*0.1;
+    }
+  });
+
+  // predation — adult predators can catch prey species, or fry/juveniles of ANY species,
+  // at very close range. A visible strike (lunge toward the target, brief flash) marks the event.
+  fish.forEach(f=>{
+    if (!DARWIN_PREDATORS.includes(f.speciesKey) || f.growthStage<3 || dead.has(f)) return;
+    fish.forEach(other=>{
+      if (other===f || dead.has(other) || !isPreyFor(other)) return;
+      if (f.pos.distanceTo(other.pos) < 0.25 && Math.random() < darwinPredationChance){
+        dead.add(other);
+        spawnPredationEffect(other.pos.clone());
+        f.burstTimer = 0.3;
+        f.vel.copy(other.pos.clone().sub(f.pos).normalize().multiplyScalar(0.5));
+      }
+    });
+  });
+
+  // intra-species aggression — once a predator species gets crowded, adults start
+  // fighting each other over territory/resources, not just hunting smaller fish
+  DARWIN_PREDATORS.forEach(key=>{
+    if (countOfSpecies(key) <= 8) return;
+    const members = fish.filter(f=>f.speciesKey===key && f.growthStage===3 && !dead.has(f));
+    members.forEach(f=>{
+      members.forEach(other=>{
+        if (other===f || dead.has(other)) return;
+        if (f.pos.distanceTo(other.pos) < 0.3 && Math.random() < darwinAggressionChance){
+          dead.add(other);
+          spawnPredationEffect(other.pos.clone());
+          f.burstTimer = 0.3;
+          f.vel.copy(other.pos.clone().sub(f.pos).normalize().multiplyScalar(0.5));
+        }
+      });
+    });
+  });
+
+  // dead fish become corpses (fall to the bottom, get scavenged) rather than vanishing outright
+  for(let i=fish.length-1;i>=0;i--){ if (dead.has(fish[i])) killFishToCorpse(i); }
+
+  // reproduction — 2+ ADULTS of a species can produce a juvenile offspring; population
+  // growth beyond the starting count (when Darwin mode was enabled) reduces the odds,
+  // representing the fixed daily feed stretching thinner across more mouths
+  darwinReproTimer -= dt;
+  if (darwinReproTimer <= 0){
+    darwinReproTimer = 4+Math.random()*3;
+    const totalNow = fish.length;
+    const scarcity = darwinStartingPopulation
+      ? Math.max(0, 1 - Math.max(0, totalNow-darwinStartingPopulation)/darwinStartingPopulation)
+      : 1;
+    Object.keys(SPECIES_DISPLAY).forEach(key=>{
+      if (countOfAdults(key) >= 2 && countOfSpecies(key) < MAX_PER_SPECIES && Math.random() < 0.35*scarcity){
+        addFishOfSpecies(key, true);
+      }
+    });
+  }
+}
+let restockActive = false;
+let restockRows = {};
+function updateRestockRows(){
+  Object.keys(restockRows).forEach(key=>{
+    const c = countOfSpecies(key);
+    const row = restockRows[key];
+    row.countSpan.textContent = c;
+    row.minusBtn.disabled = c<=0;
+    row.plusBtn.disabled = c>=MAX_PER_SPECIES;
+    row.minusBtn.style.opacity = c<=0 ? '0.3' : '1';
+    row.plusBtn.style.opacity = c>=MAX_PER_SPECIES ? '0.3' : '1';
+  });
+}
+function buildRestockPanel(){
+  const div = document.createElement('div');
+  div.id = 'restockPanel';
+  div.style.cssText = 'display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); color:#eaf6ff; font-family:Georgia,"Times New Roman",serif; background:rgba(8,18,24,0.93); border:1px solid rgba(234,246,255,0.3); border-radius:10px; padding:20px 26px; z-index:25; min-width:300px; pointer-events:auto;';
+  const title = document.createElement('div');
+  title.textContent = 'RESTOCK THE TANK';
+  title.style.cssText = 'font-size:17px; letter-spacing:1px; text-align:center; margin-bottom:14px;';
+  div.appendChild(title);
+  const btnStyle = 'width:26px; height:26px; border-radius:5px; border:1px solid rgba(234,246,255,0.35); background:rgba(234,246,255,0.08); color:#eaf6ff; font-size:15px; cursor:pointer; line-height:1;';
+  Object.keys(SPECIES_DISPLAY).forEach(key=>{
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex; align-items:center; gap:10px; padding:7px 0; border-bottom:1px solid rgba(234,246,255,0.12); font-size:14px;';
+    const label = document.createElement('span');
+    label.textContent = SPECIES_DISPLAY[key];
+    label.style.cssText = 'flex:1;';
+    const minusBtn = document.createElement('button');
+    minusBtn.textContent = '−'; minusBtn.style.cssText = btnStyle;
+    const countSpan = document.createElement('span');
+    countSpan.style.cssText = 'width:26px; text-align:center; font-variant-numeric:tabular-nums;';
+    const plusBtn = document.createElement('button');
+    plusBtn.textContent = '+'; plusBtn.style.cssText = btnStyle;
+    minusBtn.onclick = ()=>{ removeFishOfSpecies(key); updateRestockRows(); };
+    plusBtn.onclick = ()=>{ addFishOfSpecies(key); updateRestockRows(); };
+    row.appendChild(label); row.appendChild(minusBtn); row.appendChild(countSpan); row.appendChild(plusBtn);
+    div.appendChild(row);
+    restockRows[key] = {countSpan, minusBtn, plusBtn};
+  });
+  const footer = document.createElement('div');
+  footer.textContent = `Max ${MAX_PER_SPECIES} per species — press R to close`;
+  footer.style.cssText = 'margin-top:14px; font-size:11px; opacity:0.65; text-align:center;';
+  div.appendChild(footer);
+  document.body.appendChild(div);
+  return div;
+}
+const restockPanel = buildRestockPanel();
+window.addEventListener('keydown', (e)=>{
+  if (e.key === 'r' || e.key === 'R'){
+    restockActive = !restockActive;
+    restockPanel.style.display = restockActive ? 'block' : 'none';
+    if (restockActive) updateRestockRows();
+  }
+});
+
+let fishCamActive = false;
+let fishCamTarget = null;
+const fishCamPos = new THREE.Vector3();
+const fishCamLook = new THREE.Vector3();
+const fishCamForward = new THREE.Vector3();
+
+function fishForward(f){
+  // the fish group's local +Z is "forward" (head direction) — see the lookAt()-orientation
+  // convention established earlier for non-camera objects in this file
+  return fishCamForward.set(0,0,1).applyQuaternion(f.group.quaternion).clone();
+}
+function updateFishCamHUD(){
+  const hud = document.getElementById('fishCamHud');
+  if (fishCamActive && fishCamTarget){
+    document.getElementById('fishCamSpecies').textContent = SPECIES_DISPLAY[fishCamTarget.speciesKey] || fishCamTarget.speciesKey;
+    hud.style.display = 'block';
+  } else {
+    hud.style.display = 'none';
+  }
+}
+function toggleFishCam(){
+  fishCamActive = !fishCamActive;
+  if (fishCamActive){
+    fishCamTarget = fish[Math.floor(Math.random()*fish.length)];
+    const fwd = fishForward(fishCamTarget);
+    fishCamPos.copy(fishCamTarget.pos).addScaledVector(fwd, -1.6);
+    fishCamPos.y += 0.18;
+    fishCamLook.copy(fishCamTarget.pos).addScaledVector(fwd, 0.5);
+  } else {
+    fishCamTarget = null;
+  }
+  updateFishCamHUD();
+}
+window.addEventListener('keydown', (e)=>{
+  if (e.key === 'c' || e.key === 'C'){ toggleFishCam(); }
+});
+function updateFishCam(dt){
+  const f = fishCamTarget;
+  const fwd = fishForward(f);
+  const desiredPos = f.pos.clone().addScaledVector(fwd, -1.6);
+  desiredPos.y += 0.18;
+  fishCamPos.lerp(desiredPos, Math.min(1, dt*3.5));
+  camera.position.copy(fishCamPos);
+  const lookTarget = f.pos.clone().addScaledVector(fwd, 0.5);
+  fishCamLook.lerp(lookTarget, Math.min(1, dt*4.5));
+  camera.lookAt(fishCamLook);
+}
+
+// ---------------------------------------------------------------
+// STATS HUD — press S to toggle: fish counts by species, tank time, time to next feed
+// ---------------------------------------------------------------
+let statsActive = false;
+function pad2(n){ return String(Math.floor(n)).padStart(2,'0'); }
+function formatTankTime(){
+  const effectiveSeconds = darwinMode ? darwinClockSeconds : tankSeconds;
+  const day = Math.floor(effectiveSeconds/TANK_DAY_SECONDS) + 1;
+  const todaySeconds = effectiveSeconds % TANK_DAY_SECONDS;
+  const hh = Math.floor(todaySeconds/3600);
+  const mm = Math.floor((todaySeconds%3600)/60);
+  const ss = Math.floor(todaySeconds%60);
+  return `Day ${day}, ${pad2(hh)}:${pad2(mm)}:${pad2(ss)}`;
+}
+function formatNextFeed(){
+  if (feedingActive) return 'feeding now';
+  const nextFeedTankSeconds = (lastFeedDay+1)*TANK_DAY_SECONDS;
+  const remainingRealSeconds = Math.max(0, (nextFeedTankSeconds - tankSeconds) / TANK_TIME_SCALE);
+  return `${pad2(remainingRealSeconds/60)}:${pad2(remainingRealSeconds%60)}`;
+}
+function updateStatsHUD(){
+  const hud = document.getElementById('statsHud');
+  if (!statsActive){ hud.style.display = 'none'; return; }
+  hud.style.display = 'block';
+  const counts = {};
+  fish.forEach(f=>{ counts[f.speciesKey] = (counts[f.speciesKey]||0)+1; });
+  const lines = ['-- TANK STATS --', ''];
+  Object.keys(SPECIES_DISPLAY).forEach(k=>{
+    if (counts[k]) lines.push(`${SPECIES_DISPLAY[k].padEnd(12)} ${counts[k]}`);
+  });
+  lines.push('');
+  lines.push(`Tank time:  ${formatTankTime()}`);
+  lines.push(`Next feed:  ${formatNextFeed()}`);
+  lines.push(`Light level:${String(Math.round(currentLightLevel*100)).padStart(4)}%`);
+  hud.textContent = lines.join('\n');
+}
+window.addEventListener('keydown', (e)=>{
+  if (e.key === 's' || e.key === 'S'){ statsActive = !statsActive; updateStatsHUD(); }
+});
+
+// ---------------------------------------------------------------
+// TAP THE GLASS — press T
+// ---------------------------------------------------------------
+let tapAudioCtx = null;
+function playTapSound(){
+  try {
+    if (!tapAudioCtx) tapAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (tapAudioCtx.state === 'suspended') tapAudioCtx.resume();
+    const ctx = tapAudioCtx;
+    const now = ctx.currentTime;
+    // a short, sharp knock: a quick pitched thump plus a touch of filtered noise for "glass" texture
+    const osc = ctx.createOscillator();
+    const oscGain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(340, now);
+    osc.frequency.exponentialRampToValueAtTime(120, now+0.05);
+    oscGain.gain.setValueAtTime(0.5, now);
+    oscGain.gain.exponentialRampToValueAtTime(0.001, now+0.09);
+    osc.connect(oscGain); oscGain.connect(ctx.destination);
+    osc.start(now); osc.stop(now+0.1);
+
+    const bufSize = ctx.sampleRate*0.06;
+    const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for(let i=0;i<bufSize;i++) data[i] = (Math.random()*2-1)*(1-i/bufSize);
+    const noise = ctx.createBufferSource();
+    noise.buffer = buf;
+    const noiseFilter = ctx.createBiquadFilter();
+    noiseFilter.type = 'highpass';
+    noiseFilter.frequency.value = 1800;
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.setValueAtTime(0.35, now);
+    noiseGain.gain.exponentialRampToValueAtTime(0.001, now+0.06);
+    noise.connect(noiseFilter); noiseFilter.connect(noiseGain); noiseGain.connect(ctx.destination);
+    noise.start(now);
+  } catch(e){ /* audio not available — fail silently */ }
+}
+function spawnTapFlash(x, y, z){
+  const geo = new THREE.RingGeometry(0.5, 0.62, 20);
+  const mat = new THREE.MeshBasicMaterial({color:0xeaf6ff, transparent:true, opacity:0.55, side:THREE.DoubleSide, depthWrite:false});
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(x, y, z);
+  scene.add(mesh);
+  bubblePops.push({mesh, age:0, duration:0.35, maxRadius:0.55});
+}
+function tapGlass(){
+  const x = (Math.random()-0.5)*(W-2.5);
+  const y = 0.7+Math.random()*(H-1.6);
+  const z = HALF_D-0.03;
+  spawnTapFlash(x, y, z);
+  playTapSound();
+  const tapPoint = new THREE.Vector3(x, y, z);
+  fish.forEach(f=>{
+    const dist = f.pos.distanceTo(tapPoint);
+    if (dist < 3.2){
+      const away = f.pos.clone().sub(tapPoint).normalize();
+      f.burstTimer = 0.4+Math.random()*0.3;
+      const speed = Math.max(f.vel.length()||0.25, 0.5)*(1-dist/3.2)*0.6+0.35;
+      f.vel.copy(away.multiplyScalar(speed));
+    }
+  });
+}
+let lastTapTime = -10;
+window.addEventListener('keydown', (e)=>{
+  if (e.key === 't' || e.key === 'T'){
+    const now = performance.now()/1000;
+    if (now - lastTapTime > 0.5){ lastTapTime = now; tapGlass(); }
+  }
+});
+window.addEventListener('keydown', (e)=>{
+  if (e.key === 'f' || e.key === 'F'){ startFeeding(); }
+});
+
+// ---------------------------------------------------------------
+// HELP OVERLAY — press H
+// ---------------------------------------------------------------
+let helpActive = false;
+const HELP_COMMANDS = [
+  {key:'C', desc:'Toggle fish cam — follow a random fish'},
+  {key:'D', desc:'Toggle Darwin mode — aging, birth, predation'},
+  {key:'F', desc:'Trigger an extra feeding'},
+  {key:'H', desc:'Toggle this help panel'},
+  {key:'P', desc:'Darwin settings — predation/aggression sliders'},
+  {key:'R', desc:'Restock — add or remove fish by species'},
+  {key:'S', desc:'Toggle the stats panel'},
+  {key:'T', desc:'Tap the glass — startles nearby fish'},
+];
+function buildHelpPanel(){
+  const div = document.createElement('div');
+  div.id = 'helpPanel';
+  div.style.cssText = 'display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); color:#eaf6ff; font-family:Georgia,"Times New Roman",serif; font-size:15px; line-height:2; background:rgba(8,18,24,0.88); border:1px solid rgba(234,246,255,0.3); border-radius:10px; padding:22px 30px; z-index:20; pointer-events:none; white-space:pre;';
+  const lines = ['CONTROLS', ''];
+  HELP_COMMANDS.slice().sort((a,b)=>a.key.localeCompare(b.key)).forEach(c=>{
+    lines.push(`${c.key.padEnd(4)} ${c.desc}`);
+  });
+  div.textContent = lines.join('\n');
+  document.body.appendChild(div);
+  return div;
+}
+const helpPanel = buildHelpPanel();
+window.addEventListener('keydown', (e)=>{
+  if (e.key === 'h' || e.key === 'H'){
+    helpActive = !helpActive;
+    helpPanel.style.display = helpActive ? 'block' : 'none';
+  }
+});
+
+// ---------------------------------------------------------------
+// BUBBLES
+// ---------------------------------------------------------------
+function makeBubbleStream(originX, originZ, count){
+  const geo = new THREE.SphereGeometry(1, 16, 12);
+  const matOpts = {
+    color:0xc4ccd4, metalness:0.65, transparent:true, opacity:0.45, roughness:0.02,
+    clearcoat:1, clearcoatRoughness:0.001, ior:1.05,
+    emissive:0xb8c4cc, emissiveIntensity:0.25
+  };
+  if (sharedEnvMap){ matOpts.envMap = sharedEnvMap; matOpts.envMapIntensity = 3.6; }
+  const mat = new THREE.MeshPhysicalMaterial(matOpts);
+  const mesh = new THREE.InstancedMesh(geo, mat, count);
+  const data = [];
+  for(let i=0;i<count;i++){
+    const big = Math.random() < 0.28;
+    data.push({
+      x: originX+(Math.random()-0.5)*0.15, z: originZ+(Math.random()-0.5)*0.15,
+      y: Math.random()*H, speed: (big? 0.55:0.4)+Math.random()*0.35,
+      wobble: Math.random()*20, wobble2: Math.random()*20,
+      scale: big ? (0.032+Math.random()*0.03) : (0.013+Math.random()*0.016)
+    });
+  }
+  mesh.userData = {data, originX, originZ};
+  scene.add(mesh);
+  return mesh;
+}
+// a small quick pop when a bubble reaches the surface
+let bubblePops = [];
+function spawnBubblePop(x, z, size){
+  const geo = new THREE.RingGeometry(0.7, 1, 14);
+  const mat = new THREE.MeshBasicMaterial({color:0xffffff, transparent:true, opacity:0.65, side:THREE.DoubleSide, depthWrite:false});
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.x = -Math.PI/2;
+  mesh.position.set(x, H-0.055, z);
+  mesh.scale.setScalar(0.001);
+  scene.add(mesh);
+  bubblePops.push({mesh, age:0, duration:0.3+Math.random()*0.12, maxRadius:size});
+}
+function updateBubblePops(dt){
+  bubblePops.forEach(p=>{
+    p.age += dt;
+    const f = Math.min(1, p.age/p.duration);
+    p.mesh.scale.setScalar(Math.max(0.001, p.maxRadius*f));
+    p.mesh.material.opacity = 0.65*(1-f);
+  });
+  const surviving = [];
+  bubblePops.forEach(p=>{
+    if (p.age >= p.duration){ scene.remove(p.mesh); p.mesh.geometry.dispose(); p.mesh.material.dispose(); }
+    else surviving.push(p);
+  });
+  bubblePops = surviving;
+}
+function updateBubbles(mesh, dt, t){
+  const {data, originX, originZ} = mesh.userData;
+  for(let i=0;i<data.length;i++){
+    const d = data[i];
+    d.y += d.speed*dt;
+    if (d.y > H-0.05){ spawnBubblePop(d.x, d.z, d.scale*4); d.y = 0.05; d.x=originX+(Math.random()-0.5)*0.15; d.z=originZ+(Math.random()-0.5)*0.15; }
+    const wobX = Math.sin(t*3+d.wobble)*0.05 + Math.sin(t*1.3+d.wobble2)*0.02;
+    const wobZ = Math.cos(t*2.4+d.wobble2)*0.035;
+    const pulse = 1 + Math.sin(t*8+d.wobble)*0.06;
+    dummy.position.set(d.x+wobX, d.y, d.z+wobZ);
+    dummy.scale.setScalar(d.scale*pulse);
+    dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+}
+const bubbleStreams = [-(HALF_W-2), HALF_W-2].map((x,i)=>makeBubbleStream(x, i%2===0?0.3:-0.2, 50));
+
+// occasional stray bubbles from the sand — sparse, single bubbles, unlike the two steady air-stone streams
+let strayBubbles = [];
+let strayBubbleTimer = 5+Math.random()*8;
+function spawnStrayBubble(){
+  const x = (Math.random()-0.5)*(W-1.0);
+  const z = (Math.random()-0.5)*(D-0.6);
+  const geo = new THREE.SphereGeometry(1, 7, 6);
+  const matOpts = {color:0xc4ccd4, metalness:0.65, transparent:true, opacity:0.45, roughness:0.02, clearcoat:1, clearcoatRoughness:0.001, ior:1.05, emissive:0xb8c4cc, emissiveIntensity:0.25};
+  if (sharedEnvMap){ matOpts.envMap = sharedEnvMap; matOpts.envMapIntensity = 3.6; }
+  const mat = new THREE.MeshPhysicalMaterial(matOpts);
+  const mesh = new THREE.Mesh(geo, mat);
+  const sc = 0.008+Math.random()*0.015;
+  mesh.scale.setScalar(sc);
+  mesh.position.set(x, 0.06, z);
+  scene.add(mesh);
+  strayBubbles.push({mesh, pos:new THREE.Vector3(x,0.06,z), speed:0.3+Math.random()*0.25, wobble:Math.random()*20});
+}
+function updateStrayBubbles(dt, t){
+  strayBubbleTimer -= dt;
+  if (strayBubbleTimer <= 0){
+    strayBubbleTimer = 6+Math.random()*16; // occasional and sparse
+    spawnStrayBubble();
+  }
+  strayBubbles.forEach(b=>{
+    b.pos.y += b.speed*dt;
+    b.pos.x += Math.sin(t*3+b.wobble)*0.003;
+    b.mesh.position.copy(b.pos);
+  });
+  const surviving = [];
+  strayBubbles.forEach(b=>{
+    if (b.pos.y > H-0.1){ spawnBubblePop(b.pos.x, b.pos.z, b.mesh.scale.x*4); scene.remove(b.mesh); } else { surviving.push(b); }
+  });
+  strayBubbles = surviving;
+}
+
+// ---------------------------------------------------------------
+// CAMERA — gentle idle drift, framed on the tank
+// ---------------------------------------------------------------
+camera.position.set(0, H*0.55, 7.5);
+camera.lookAt(0, H*0.45, 0);
+
+const FRONT_VIEW_Z = 7.5;
+function updateCamera(t){
+  const panRange = HALF_W - 3.4; // keep the tank's far ends in frame rather than panning past them
+  camera.position.x = Math.sin(t*0.01)*panRange;
+  camera.position.y = H*0.55 + Math.sin(t*0.065)*0.12;
+  camera.position.z = FRONT_VIEW_Z;
+  camera.lookAt(camera.position.x*0.94, H*0.45, 0);
+}
+
+// ---------------------------------------------------------------
+// ANIMATE
+// ---------------------------------------------------------------
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = Math.min(0.05, clock.getDelta());
+  const t = clock.elapsedTime;
+
+  updateFeeding(dt, t);
+  updateDayNightLighting();
+  fish.forEach(f=>f.update(dt,t));
+  if (fishCamActive && fishCamTarget) updateFishCam(dt); else updateCamera(t);
+  updateStatsHUD();
+  updatePlants(t);
+  bubbleStreams.forEach(b=>updateBubbles(b,dt,t));
+  updateStrayBubbles(dt,t);
+  updateBubblePops(dt);
+  updateSandPuffs(dt);
+  if (darwinMode){ updateDarwinMode(dt); updateCorpses(dt); }
+
+  renderer.render(scene, camera);
+}
+
+setTimeout(()=>{
+  const el = document.getElementById('loading');
+  el.style.opacity = '0';
+  setTimeout(()=>el.remove(), 1300);
+}, 300);
+
+animate();
+
+})();
+</script>
+</body>
+</html>
